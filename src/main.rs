@@ -634,8 +634,15 @@ async fn ensure_remote_exists(remote: &str) -> Result<bool> {
 }
 
 /// With no memory named, offer to set one up on the Hub — but only when a token is present and we can
-/// prompt. Suggests `<user>/funes-memory`: use it if it exists, offer to create it if not. Returns the
-/// memory to bind (with whether it was just created), or `None` to stay local.
+/// prompt. Suggests `<user>/funes-memory`: use it if it exists, offer to create it if not. Every
+/// prompt defaults to no, so an unnamed memory stays local unless the user explicitly opts in.
+/// Returns the memory to bind (with whether it was just created), or `None` to stay local.
+///
+/// Deliberate behavior change (not part of the Windows port, and not platform-gated — it applies
+/// on every OS): all three confirmations below default to no (`[y/N]`, `default_yes: false`)
+/// instead of the previous default-yes (`[Y/n]`, `default_yes: true`). Pressing Enter, or running
+/// non-interactively, can no longer push memory to the Hub or create a dataset by accident —
+/// syncing now always requires an explicit "y"/"yes".
 async fn offer_hub_memory() -> Result<Option<Resolved>> {
     let interactive = std::io::stdin().is_terminal();
     if !hub::has_token() {
@@ -647,8 +654,8 @@ async fn offer_hub_memory() -> Result<Option<Resolved>> {
     // A scripted (non-interactive) add can't prompt, so it stays local unless a memory was named.
     if !interactive
         || !confirm(
-            "Push your memory to a Hugging Face dataset, so it follows you across machines? [Y/n] ",
-            true,
+            "Push your memory to a Hugging Face dataset, so it follows you across machines? [y/N] ",
+            false,
         )
     {
         return Ok(None);
@@ -664,7 +671,7 @@ async fn offer_hub_memory() -> Result<Option<Resolved>> {
     let uri = format!("hf://datasets/{memory}");
     match memory::remote_reachability(&uri).await {
         memory::Reachability::Ok => {
-            Ok(confirm(&format!("Use your memory {memory}? [Y/n] "), true)
+            Ok(confirm(&format!("Use your memory {memory}? [y/N] "), false)
                 .then_some(Resolved { memory, created: false }))
         }
         memory::Reachability::Offline => {
@@ -673,8 +680,8 @@ async fn offer_hub_memory() -> Result<Option<Resolved>> {
         }
         memory::Reachability::Missing => {
             if confirm(
-                &format!("Create {memory} as a private dataset for your memory? [Y/n] "),
-                true,
+                &format!("Create {memory} as a private dataset for your memory? [y/N] "),
+                false,
             ) {
                 hub::create_dataset_repo(&user, "funes-memory").await?;
                 eprintln!("created {memory} as a private dataset.");

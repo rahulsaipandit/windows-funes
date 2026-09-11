@@ -38,7 +38,10 @@ pub fn funes_dir() -> PathBuf {
     if let Ok(d) = std::env::var("FUNES_HOME") {
         return PathBuf::from(d);
     }
-    let home = std::env::var("HOME").unwrap_or_default();
+    // Windows port: no $HOME there — fall back to %USERPROFILE%, its equivalent.
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
     PathBuf::from(home).join(".funes")
 }
 

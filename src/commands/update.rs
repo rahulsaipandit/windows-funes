@@ -12,8 +12,12 @@ use hf_hub::buckets::BucketDownload;
 use hf_hub::HFBucket;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::fs::{File, Permissions};
+use std::fs::File;
+#[cfg(unix)]
+use std::fs::Permissions;
 use std::io::Read;
+// Windows port: std::os::unix doesn't exist off-unix; a downloaded .exe needs no chmod to run.
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
@@ -117,6 +121,8 @@ pub async fn run(force: bool) -> Result<()> {
 /// Verify the staged binary, confirm its reported version, and atomically rename it over `exe`.
 fn install_verified(staged: &Path, exe: &Path, manifest: &Path, asset: &str, expected_version: &str) -> Result<String> {
     verify_checksum(staged, manifest, asset)?;
+    // Windows port: no executable bit — a staged .exe already runs as-is.
+    #[cfg(unix)]
     std::fs::set_permissions(staged, Permissions::from_mode(0o755)).context("making the new binary executable")?;
 
     let out = verify_runs(staged)?;
@@ -130,10 +136,14 @@ fn install_verified(staged: &Path, exe: &Path, manifest: &Path, asset: &str, exp
 
     // Preserve the existing binary's mode so an update never broadens it (e.g. 0700 → 0755); fall
     // back to 0755 when there's no existing binary to copy the mode from.
-    let mode = std::fs::metadata(exe)
-        .map(|m| m.permissions().mode() & 0o777)
-        .unwrap_or(0o755);
-    std::fs::set_permissions(staged, Permissions::from_mode(mode)).context("setting the new binary's permissions")?;
+    // Windows port: no POSIX mode bits to preserve.
+    #[cfg(unix)]
+    {
+        let mode = std::fs::metadata(exe)
+            .map(|m| m.permissions().mode() & 0o777)
+            .unwrap_or(0o755);
+        std::fs::set_permissions(staged, Permissions::from_mode(mode)).context("setting the new binary's permissions")?;
+    }
 
     // Same-filesystem rename (staged sits in a temp dir beside exe), so this is atomic. The live
     // process holds the old inode; replacing the path it launched from is safe.
@@ -319,7 +329,9 @@ mod tests {
         std::fs::write(path, format!("{digest}  {asset}\n")).unwrap();
     }
 
+    // Windows port: both tests assert on POSIX mode bits (chmod), which don't exist off-unix.
     #[test]
+    #[cfg(unix)]
     fn install_verified_atomically_replaces() {
         use std::fs::Permissions;
         use std::os::unix::fs::PermissionsExt;
@@ -345,6 +357,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn checksum_mismatch_is_rejected_before_execution() {
         use std::os::unix::fs::PermissionsExt;
 

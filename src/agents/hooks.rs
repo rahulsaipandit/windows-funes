@@ -7,6 +7,9 @@
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+// Windows port: std::os::unix doesn't exist off-unix; chmod +x is meaningless for a Windows
+// script invoked through bash (Git Bash preserves the executable bit from checkout instead).
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -98,9 +101,13 @@ pub fn write_scripts(dir: &Path) -> Result<bool> {
     for (name, content) in [("funes-index.sh", INDEX_SH), ("funes-push.sh", PUSH_SH)] {
         let path = dir.join(name);
         changed |= write_if_changed(&path, content)?;
-        let mut perms = std::fs::metadata(&path)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).with_context(|| format!("chmod +x {}", path.display()))?;
+        // Windows port: no executable bit to set there; the hook still runs via `bash "<script>"`.
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).with_context(|| format!("chmod +x {}", path.display()))?;
+        }
     }
     Ok(changed)
 }

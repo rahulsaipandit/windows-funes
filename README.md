@@ -82,6 +82,10 @@ an agent can recall.
 Dataset repositories created by funes are **private by default**. Existing repositories retain their
 current visibility, and making a funes-created memory public is a deliberate change on the Hub.
 
+Every Hub-sync prompt during `funes add` — pushing your memory, using an existing
+`<user>/funes-memory`, or creating one — defaults to **no**: pressing Enter, or running `funes add`
+non-interactively, always stays local. Syncing to the Hub requires an explicit "y"/"yes" answer.
+
 Bind a memory when you add funes to an agent and it recalls from there and keeps it current on its
 own; or run the two commands directly:
 
@@ -174,6 +178,23 @@ Linux — so the default build has no ML runtime dependency and runs on any glib
 cargo build --release --no-default-features --features onnx   # ONNX backend instead
 cargo run --release --features onnx --example bench_backends  # A/B both backends
 ```
+
+### Windows
+
+There's no prebuilt Windows binary yet, so build from source with a native
+`x86_64-pc-windows-msvc` toolchain (`cargo`/`rustc` on PATH) and `protoc` (`winget install
+Google.Protobuf`, or set `PROTOC` to its full path). The default `blas` feature only has
+macOS/Linux backends, so build with `onnx` instead:
+
+```powershell
+cargo build --release --no-default-features --features onnx
+cargo test --no-default-features --features onnx
+```
+
+`funes update` won't find a Windows release asset yet and will tell you to rebuild from source
+instead. The `funes-index.sh`/`funes-push.sh` hooks funes installs still run through `bash`, so
+keep Git Bash (or another `bash` on PATH) available. See [docs/design.md](docs/design.md#how-to-build-native-windows)
+for the platform gates this port added.
 
 ## Notes
 

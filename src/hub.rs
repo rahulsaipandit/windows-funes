@@ -93,7 +93,9 @@ pub fn has_token() -> bool {
 
 /// HF token from the standard env var, else the `huggingface_hub` cached token file.
 pub fn hf_token() -> Option<String> {
+    // Windows port: no $HOME there — fall back to %USERPROFILE%, its equivalent.
     let token_file = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
         .ok()
         .map(|h| PathBuf::from(h).join(".cache/huggingface/token"));
     token_from(|k| std::env::var(k).ok(), token_file.as_deref())
