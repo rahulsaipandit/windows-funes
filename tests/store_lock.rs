@@ -22,6 +22,21 @@ async fn memory_lock_fails_loudly_on_contention() {
         "acquire should report contention, got: {err}"
     );
 
+    // `funes index` off a terminal, as a hook runs it, exits 75 (EX_TEMPFAIL) rather than 1.
+    std::fs::create_dir_all(home.path().join("spool/pi")).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_funes"))
+        .args(["index", "--harness", "pi"])
+        .env("HOME", home.path())
+        .stdin(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(75), "{stderr}");
+    assert!(
+        stderr.contains("another funes memory operation is in progress"),
+        "{stderr}"
+    );
+
     // scrub refuses while the lock is held (its guard is the same acquire).
     let err = funes::commands::scrub::run().await.unwrap_err();
     assert!(
@@ -30,8 +45,17 @@ async fn memory_lock_fails_loudly_on_contention() {
         "scrub should report contention, got: {err}"
     );
 
+    // A writer reaching the memory by its path, from any funes home, refuses too.
+    let memory = home.path().join("memory");
+    assert!(MemoryLock::acquire_in(&memory).is_err());
+
     // Releasing frees it for the next writer.
     drop(held);
     let regained = MemoryLock::acquire().unwrap();
     drop(regained);
+
+    // And a writer holding the memory by its path keeps the home's writers out.
+    let by_path = MemoryLock::acquire_in(&memory).unwrap();
+    assert!(MemoryLock::acquire().is_err());
+    drop(by_path);
 }

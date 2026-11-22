@@ -4,8 +4,8 @@
 //! byte-stable, its layout is a published contract (the `→ get` lines are parsed) and must not
 //! change. Every read verb answers an agent, so that is the only format here.
 
-use crate::commands::recall::{Hit, ScanCut, ScanResult, Session, Turn};
-use crate::session_sketch::{Clamped, SessionSketch};
+use crate::commands::recall::{memory_hint, Hit, ScanCut, ScanResult, Session, Turn};
+use crate::commands::sketch::{Clamped, SessionSketch};
 use std::fmt::Write as _;
 
 /// Turns each side of a hit that a `→ get` line reaches for.
@@ -16,12 +16,12 @@ fn hint_range(seq: i64) -> String {
     format!(" --from {} --to {}", (seq - HINT_WINDOW).max(0), seq + HINT_WINDOW)
 }
 
-/// The agent `recall` format: provenance header with score, a `→ get` line carrying `memory_arg`
-/// (the pre-rendered ` --memory <label>` suffix, empty for the built-in guide), the full chunk
-/// text, and truncated neighbor lines per hit. The chunk is never clipped — the ranking scored
+/// The agent `recall` format: provenance header with score, a `→ get` line naming the memory the
+/// hit was read from, the full chunk text, and the turns framing the hit's exchange under `↳` lines.
+/// The chunk is never clipped — the ranking scored
 /// all of it, so a preview could hide exactly the span that made it a hit; the chunker's size
 /// cap bounds the payload instead. Byte-stable — the layout is a published contract.
-pub fn recall_agent(note: &str, memory_arg: &str, hits: &[(Hit, f64)]) -> String {
+pub fn recall_agent(note: &str, hits: &[(Hit, f64)]) -> String {
     let mut out = note.to_string();
     for (h, score) in hits {
         let s8 = &h.session_id[..h.session_id.len().min(8)];
@@ -30,15 +30,84 @@ pub fn recall_agent(note: &str, memory_arg: &str, hits: &[(Hit, f64)]) -> String
             "[{}] {} {}/{} {}  score={:.3}",
             h.ts, h.harness, h.workdir, s8, h.block_type, score
         );
-        let _ = writeln!(out, "  → get {}{}{}", h.session_id, hint_range(h.seq), memory_arg);
+        let _ = writeln!(
+            out,
+            "  → get {}{}{}",
+            h.session_id,
+            hint_range(h.seq),
+            memory_hint(Some(&h.memory).filter(|m| !m.is_empty()).map(String::as_str))
+        );
         let _ = writeln!(out, "{}", h.text);
-        for n in &h.neighbors {
-            let np: String = n.text.chars().take(160).collect();
-            let _ = writeln!(out, "  ~ [{} {} seq{}] {}", n.role, n.block_type, n.seq, np);
+        for e in &h.exchange {
+            let _ = writeln!(out, "  ↳ [{} text seq{}]", e.role, e.seq);
+            let _ = writeln!(out, "{}", e.text);
         }
         let _ = writeln!(out, "---");
     }
     out
+}
+
+/// Characters of a hit's opening words on its `--oneline` row.
+const ONELINE_CHARS: usize = 120;
+
+/// The `recall --oneline` format: one row per hit, the provenance header and the `→ get` target
+/// joined, then the hit's opening words flattened onto the line, and no passage. For choosing what
+/// to read. Byte-stable, a contract like the agent format.
+pub fn recall_oneline(note: &str, hits: &[(Hit, f64)]) -> String {
+    let mut out = note.to_string();
+    for (h, score) in hits {
+        let s8 = &h.session_id[..h.session_id.len().min(8)];
+        let _ = writeln!(
+            out,
+            "[{}] {} {}/{} {}  score={:.3}  → get {}{}{} · {}",
+            h.ts,
+            h.harness,
+            h.workdir,
+            s8,
+            h.block_type,
+            score,
+            h.session_id,
+            hint_range(h.seq),
+            memory_hint(Some(&h.memory).filter(|m| !m.is_empty()).map(String::as_str)),
+            one_line(&h.text, ONELINE_CHARS)
+        );
+    }
+    out
+}
+
+/// `rephrase`, naming the searched memories' `languages` when there are some to name.
+fn rephrase_in(rephrase: &str, languages: Option<&str>) -> String {
+    match languages {
+        Some(languages) => format!("{rephrase} or in a language detected in the searched memories ({languages})"),
+        None => rephrase.to_string(),
+    }
+}
+
+/// What a `recall` reply closes with: the follow-ups that find a missed answer for the fewest tokens.
+fn recall_miss(languages: Option<&str>) -> String {
+    format!(
+        "if these miss: {}, then raise --k; a get line only reads around its own hit",
+        rephrase_in("rephrase in the words the hits use", languages)
+    )
+}
+
+/// A `recall` reply: the agent format closed by [`recall_miss`], or `no results` and a hint. Byte-stable.
+pub fn recall_reply(note: &str, hits: &[(Hit, f64)], languages: Option<&str>) -> String {
+    if hits.is_empty() {
+        return format!(
+            "{note}no results\n{}",
+            rephrase_in("rephrase in other words", languages)
+        );
+    }
+    format!("{}{}\n", recall_agent(note, hits), recall_miss(languages))
+}
+
+/// [`recall_reply`] in the one-line format. Byte-stable.
+pub fn recall_oneline_reply(note: &str, hits: &[(Hit, f64)], languages: Option<&str>) -> String {
+    if hits.is_empty() {
+        return recall_reply(note, hits, languages);
+    }
+    format!("{}{}\n", recall_oneline(note, hits), recall_miss(languages))
 }
 
 /// The agent `scan` format: a header naming the needle, the session and the window, then one line
@@ -173,7 +242,8 @@ fn one_line(s: &str, max: usize) -> String {
 }
 
 /// The agent `sessions` format: a row per session, oldest first, each carrying the prompt it opened
-/// with on an indented second line, closed by the total. The session id is printed whole — it is the
+/// with on an indented second line, closed by the total. A row is the session's span, first stamp
+/// to last indexed turn, then harness, origin, turn count and id. The id is printed whole — it is the
 /// payload here, not a pointer into a hint line. `total` is every session the filter matched and
 /// `offset` where this page started, so the trailer can name the offset that continues.
 /// Byte-stable.
@@ -187,8 +257,9 @@ pub fn sessions_agent(note: &str, sessions: &[Session], total: usize, offset: us
         let mut row = String::new();
         let _ = writeln!(
             row,
-            "[{}] {} {} {} turns {}",
-            s.date(),
+            "[{} → {}] {} {} {} turns {}",
+            s.ts,
+            s.last_ts,
             s.harness,
             s.origin(),
             s.turns,
@@ -271,10 +342,12 @@ pub fn dim(s: &str, color: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::recall::Neighbor;
+    use crate::commands::recall::{ExchangeTurn, ScanHit};
+    use crate::commands::sketch::{Diagnostics, Evidence};
 
     fn hit(ts: &str, block_type: &str, text: &str) -> Hit {
         Hit {
+            id: "c1".to_string(),
             text: text.to_string(),
             session_id: "0123456789abcdef".to_string(),
             workdir: "-home-u-funes".to_string(),
@@ -283,7 +356,9 @@ mod tests {
             ts: ts.to_string(),
             block_type: block_type.to_string(),
             harness: "claude_code".to_string(),
-            neighbors: vec![],
+            exchange: vec![],
+            memory: "hf://datasets/acme/kb".to_string(),
+            fused: 0.0,
         }
     }
 
@@ -291,27 +366,92 @@ mod tests {
     // byte-for-byte.
     #[test]
     fn agent_format_is_byte_stable() {
-        let mut h = hit("2026-06-19T01:29:59.000Z", "text", "the decision was made");
-        h.neighbors.push(Neighbor {
-            seq: 5,
-            role: "assistant".to_string(),
-            block_type: "text".to_string(),
-            text: "hello".to_string(),
-        });
-        let out = recall_agent("", " --memory hf://datasets/acme/kb", &[(h, 0.5781)]);
+        let h = hit("2026-06-19T01:29:59.000Z", "text", "the decision was made");
+        let out = recall_agent("", &[(h, 0.5781)]);
         assert_eq!(
             out,
             "[2026-06-19T01:29:59.000Z] claude_code -home-u-funes/01234567 text  score=0.578\n\
              \x20 → get 0123456789abcdef --from 4 --to 10 --memory hf://datasets/acme/kb\n\
              the decision was made\n\
-             \x20 ~ [assistant text seq5] hello\n\
              ---\n"
         );
-        // The built-in guide has no memory to name: an empty suffix keeps the hint bare.
-        let bare = recall_agent("", "", &[(hit("2026-06-19T01:29:59.000Z", "text", "x"), 0.5)]);
+        // A hit with no memory to name keeps the hint bare.
+        let mut unnamed = hit("2026-06-19T01:29:59.000Z", "text", "x");
+        unnamed.memory.clear();
+        let bare = recall_agent("", &[(unnamed, 0.5)]);
         assert!(
             bare.contains("  → get 0123456789abcdef --from 4 --to 10\n"),
             "got: {bare}"
+        );
+    }
+
+    #[test]
+    fn agent_format_frames_a_hit_with_its_exchange() {
+        let mut h = hit("2026-06-19T01:29:59.000Z", "text", "the decision was made");
+        h.exchange.push(ExchangeTurn {
+            seq: 3,
+            role: "user".to_string(),
+            text: "should we keep it?".to_string(),
+        });
+        h.exchange.push(ExchangeTurn {
+            seq: 9,
+            role: "assistant".to_string(),
+            text: "we keep it".to_string(),
+        });
+        assert_eq!(
+            recall_agent("", &[(h, 0.5781)]),
+            "[2026-06-19T01:29:59.000Z] claude_code -home-u-funes/01234567 text  score=0.578\n\
+             \x20 → get 0123456789abcdef --from 4 --to 10 --memory hf://datasets/acme/kb\n\
+             the decision was made\n\
+             \x20 ↳ [user text seq3]\n\
+             should we keep it?\n\
+             \x20 ↳ [assistant text seq9]\n\
+             we keep it\n\
+             ---\n"
+        );
+    }
+
+    // The one-line format is a contract too: a row holds the header, the `→ get` target and the
+    // opening words flattened, cut at ONELINE_CHARS.
+    #[test]
+    fn oneline_format_is_byte_stable() {
+        let h = hit("2026-06-19T01:29:59.000Z", "text", "the decision\n  was made");
+        assert_eq!(
+            recall_oneline("", &[(h, 0.5781)]),
+            "[2026-06-19T01:29:59.000Z] claude_code -home-u-funes/01234567 text  score=0.578  → get 0123456789abcdef --from 4 --to 10 --memory hf://datasets/acme/kb · the decision was made\n"
+        );
+        let long = hit("2026-06-19T01:29:59.000Z", "text", &"word ".repeat(40));
+        let row = recall_oneline("", &[(long, 0.5)]);
+        assert!(row.ends_with("…\n"), "got: {row}");
+        assert_eq!(row.split(" · ").nth(1).unwrap().chars().count(), ONELINE_CHARS + 2);
+    }
+
+    #[test]
+    fn a_recall_reply_closes_with_what_to_try_on_a_miss() {
+        let h = || hit("2026-06-19T01:29:59.000Z", "text", "the decision was made");
+        assert_eq!(
+            recall_reply("", &[(h(), 0.5781)], None),
+            format!(
+                "{}if these miss: rephrase in the words the hits use, then raise --k; \
+                 a get line only reads around its own hit\n",
+                recall_agent("", &[(h(), 0.5781)])
+            )
+        );
+        assert_eq!(
+            recall_reply("", &[(h(), 0.5781)], Some("eng, por")),
+            format!(
+                "{}if these miss: rephrase in the words the hits use or in a language detected in the searched memories \
+                 (eng, por), then raise --k; a get line only reads around its own hit\n",
+                recall_agent("", &[(h(), 0.5781)])
+            )
+        );
+        assert_eq!(
+            recall_reply("remote down\n", &[], None),
+            "remote down\nno results\nrephrase in other words"
+        );
+        assert_eq!(
+            recall_reply("", &[], Some("eng, por")),
+            "no results\nrephrase in other words or in a language detected in the searched memories (eng, por)"
         );
     }
 
@@ -326,7 +466,7 @@ mod tests {
     #[test]
     fn agent_prepends_note_and_keeps_full_chunk() {
         let long: String = "x".repeat(1200);
-        let out = recall_agent("remote down\n", "", &[(hit("bad-ts", "text", &long), 1.0)]);
+        let out = recall_agent("remote down\n", &[(hit("bad-ts", "text", &long), 1.0)]);
         assert!(out.starts_with("remote down\n[bad-ts]"));
         // The matched chunk is never clipped.
         assert!(out.contains(&long));
@@ -353,6 +493,110 @@ mod tests {
             get_agent("", &[t], 70),
             "[2026-06-19T01:29:59.000Z] assistant seq3 turn=t-1\nfirst\n\nsecond\n---\n\
              turns 3-3 of 70\n"
+        );
+    }
+
+    #[test]
+    fn scan_agent_is_byte_stable() {
+        let r = ScanResult {
+            needle: "fold".to_string(),
+            session_id: "0123456789abcdef".to_string(),
+            hits: vec![ScanHit {
+                turn_uuid: "t-5".to_string(),
+                ts: "2026-06-19T01:29:59.000Z".to_string(),
+                block_type: "text".to_string(),
+                seq: 5,
+                at: 4,
+                len: 4,
+                text: "the fold streams every batch".to_string(),
+            }],
+            dropped: 2,
+            cut: Some(ScanCut::Resume(9)),
+            from: Some(2),
+            to: None,
+        };
+        assert_eq!(
+            scan_agent("", " --memory hf://datasets/acme/kb", &r, 6),
+            "scan \"fold\" in 0123456789abcdef turns 2 on — 3 hits\n\
+             [2026-06-19T01:29:59.000Z] text seq5\n\
+             \x20 → get 0123456789abcdef --from 2 --to 8 --memory hf://datasets/acme/kb\n\
+             \x20 the fold strea …\n\
+             2 more hits not shown — continue with --from 9\n\
+             ---\n"
+        );
+        let none = ScanResult {
+            hits: vec![],
+            dropped: 0,
+            cut: None,
+            to: Some(4),
+            ..r
+        };
+        assert_eq!(
+            scan_agent("", "", &none, 6),
+            "no matches for \"fold\" in 0123456789abcdef turns 2-4\n---\n"
+        );
+    }
+
+    #[test]
+    fn sketch_agent_is_byte_stable() {
+        let evidence = |seq: i64, block_type: &str, tool_name: Option<&str>, truncated: bool, text: &str| Evidence {
+            id: format!("c{seq}"),
+            turn_uuid: format!("t-{seq}"),
+            seq,
+            block_idx: 0,
+            ts: "2026-06-19T01:29:59.000Z".to_string(),
+            role: "assistant".to_string(),
+            block_type: block_type.to_string(),
+            tool_name: tool_name.map(str::to_string),
+            reasons: vec![],
+            truncated,
+            text: text.to_string(),
+        };
+        let sketch = SessionSketch {
+            schema_version: 1,
+            selector_version: "v".to_string(),
+            memory: "hf://datasets/acme/kb".to_string(),
+            session_id: "0123456789abcdef".to_string(),
+            source_fingerprint: String::new(),
+            embedding_fingerprint: String::new(),
+            source_chunks: 40,
+            eligible_units: 12,
+            evidence: vec![
+                evidence(1, "text", None, false, "we settle on a fold"),
+                evidence(7, "tool_use", Some("Bash"), true, "cargo test --lib …"),
+            ],
+            diagnostics: Diagnostics {
+                axes: 0,
+                transitions: 0,
+                near_duplicate_groups: 0,
+                duplicate_strategy: String::new(),
+                duplicate_vector_comparisons: 0,
+                candidates: 0,
+                rendered_characters: 37,
+                budget: 6,
+                char_budget: 1000,
+                elapsed_ms: 0,
+                fallback: Some("no embeddings: picked by position".to_string()),
+            },
+        };
+        let clamped = Clamped {
+            units: Some(6),
+            chars: Some(1000),
+        };
+        assert_eq!(
+            sketch_agent("", " --memory hf://datasets/acme/kb", &sketch, clamped),
+            "sketch 0123456789abcdef — 2 of 6 places · 37 of 1000 chars · 12 eligible units\n\
+             \x20 (units clamped to 6)\n\
+             \x20 (max-chars clamped to 1000)\n\
+             \x20 (no embeddings: picked by position)\n\
+             [2026-06-19T01:29:59.000Z] assistant text seq1\n\
+             \x20 → get 0123456789abcdef --from 0 --to 4 --memory hf://datasets/acme/kb\n\
+             we settle on a fold\n\
+             [2026-06-19T01:29:59.000Z] assistant tool_use (Bash) seq7 · shortened\n\
+             \x20 → get 0123456789abcdef --from 4 --to 10 --memory hf://datasets/acme/kb\n\
+             cargo test --lib …\n\
+             ---\n\
+             a sketch samples: it shows what it selected, not that anything is absent — scan a literal for that\n"
         );
     }
 
@@ -416,6 +660,7 @@ mod tests {
         Session {
             session_id: format!("session-{i:03}"),
             ts: "2026-06-19T01:29:59.000Z".to_string(),
+            last_ts: "2026-06-19T01:30:59.000Z".to_string(),
             workdir: "/home/u/funes".to_string(),
             harness: "codex".to_string(),
             repo: format!("owner/{}", "r".repeat(100)),

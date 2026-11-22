@@ -1,10 +1,15 @@
 # Benchmarks
 
-Three runnable examples, each `cargo run --release --example <name>`:
+Six runnable examples, each `cargo run --release --example <name>`:
 
-- **`bench_recall`** — `recall()` latency, local vs remote, cold vs warm (below).
-- **`bench_index`** — `index` build time, throughput, and memory compactness (at the end).
-- **`bench_backends`** — latency and output agreement between the BLAS and ONNX inference backends.
+- **`bench_recall`** — `recall()` latency, local vs remote, cold vs warm.
+- **`bench_index`** — the part of `funes index` that writes rows, without the embedding.
+- **`bench_models`** — embedding and reranking time on one inference backend.
+- **`score_models`** — how closely the inference backends reproduce ONNX Runtime's embeddings and
+  reranker scores.
+- **`score_recall`** — `funes recall` scored against a labeled set of questions.
+- **`sweep_rerank`** — how much reranking helps at each pool size, on a `dacorvo/funes-recall-benchmark`
+  set.
 
 ## `bench_recall` — recall latency
 
@@ -15,15 +20,17 @@ dataset over `hf://` — both legs run identical data, so the gap is the I/O pat
 
 ## What it measures
 
-Every timed call runs the whole recall pipeline:
+Every timed call runs the recall pipeline:
 
 ```
-embed query → vector ANN + BM25 FTS (fused by RRF) → cross-encoder rerank → recency → neighbors → format
+embed query → vector ANN + BM25 FTS (fused by RRF) → [cross-encoder rerank] → format
 ```
 
-The CPU stages (query embed + BGE cross-encoder rerank) are identical whatever the memory, so the
-local↔remote gap is entirely the I/O path: opening the dataset, the ANN/FTS scans, and the neighbor
-fetch. The embed + rerank models are loaded once in a warm-up call that is **excluded** from all
+The rerank runs whenever the pool holds more rows than `--k`, so a default timed call (8 of 30)
+reranks 30 pairs. `--candidates 8` times a call without one.
+
+The CPU stages (query embed, and the rerank when it runs) are identical whatever the memory, so the
+local↔remote gap is entirely the I/O path: opening the dataset and the ANN/FTS scans. The embed + rerank models are loaded once in a warm-up call that is **excluded** from all
 timings.
 
 For each memory the harness reports a single **cold** call followed by the min / median / max of
@@ -41,7 +48,7 @@ For each memory the harness reports a single **cold** call followed by the min /
 Build in release (a debug build is far slower and not representative):
 
 ```sh
-cargo run --release --example bench_recall -- "<query>" --remote dacorvo/funes-Glint-Research-Fable-5 --iters 5 --cold
+cargo run --release --example bench_recall -- "<query>" --remote huggingface/funes-memory --iters 5 --cold
 ```
 
 The bench downloads `--remote` (through the hf-hub crate, using the token from your environment for a
@@ -53,12 +60,11 @@ both legs run identical data, so the gap is the I/O path, not the corpus.
 | flag | default | meaning |
 |------|---------|---------|
 | `<query>` (positional) | `"how does recall rerank candidates"` | the text to recall |
-| `--remote <spec>` | `dacorvo/funes-Glint-Research-Fable-5` | dataset to benchmark (`org/repo` or `hf://…`), used for both legs |
+| `--remote <spec>` | `huggingface/funes-memory` | dataset to benchmark (`org/repo` or `hf://…`), used for both legs |
 | `--iters <N>` | `5` | warm iterations timed per memory (after the one cold call) |
 | `--cold` | off | give the remote leg a throwaway `HF_HUB_CACHE` temp dir so its cold call is a true download (your real cache is left untouched) |
 | `--k <N>` | `8` | results returned |
 | `--candidates <N>` | `30` | fused candidates reranked |
-| `--neighbors <N>` | `1` | adjacent chunks attached per hit |
 
 > `--cold` only relocates the hf-hub file **cache** (via `HF_HUB_CACHE`) to a temp dir for the run —
 > it does not touch your real `~/.cache/huggingface/hub`, your HF token, or `HF_HOME`. The local-leg
@@ -67,29 +73,16 @@ both legs run identical data, so the gap is the I/O path, not the corpus.
 
 ## Reading the output
 
-```
-dataset: dacorvo/funes-Glint-Research-Fable-5   query: "how does recall rerank candidates"   k=8 candidates=30 neighbors=1   warm iters=5
+A header repeats the dataset, the query and the knobs. Then one row per memory: `cold(ms)` is the
+single cold call, `warm_lo` / `warm_med` / `warm_hi` the min / median / max over the `--iters` warm
+calls, and `hits` the results returned, equal on both rows when both legs did the same work. A last
+line gives the remote-to-local ratios: cold, warm median and warm best-case. `warm_lo` is the most
+stable of the three, and `warm_hi` spikes are page-cache noise at low `--iters`.
 
-memory    cold(ms)   warm_lo  warm_med   warm_hi  hits
-local       5455.9    5682.6    5956.0    6093.4     8
-remote     10663.1    6504.0    6589.1    6668.6     8
-
-remote vs local:  2.0× slower cold,  1.1× slower warm (median),  1.1× warm best-case
-```
-
-_Captured on a Mac M2 (24 GB), release build._
-
-Both legs run the same ≈21.6k-chunk dataset (`hits` matches, confirming equal work). Remote **cold**
-pays a one-time download of the index + touched Lance fragments into the hf-hub file cache (the
-premium over warm). Every **warm** call is then served from that local cache, so warm remote lands at
-**≈ local** (1.1×) — the per-call `hf://` I/O is gone. `warm best-case` (`warm_lo`) is the most stable
-factor; `warm_hi` spikes are page-cache/GC noise at low `--iters`.
-
-**Absolute numbers are host-dependent — read the ratio, not the floor.** Recall is dominated by the
-cross-encoder rerank (`--candidates` query/passage pairs), identical work on both legs: the Mac M2
-above reranks ~5–6 s for 30 candidates on CPU, whereas a Linux box with a GPU does it in well under a
-second (local ≈ remote-warm ≈ ~1.9 s). The floor moves with the hardware; the remote-vs-local
-**ratio** — warm ≈ local, cold a one-time download — is what the benchmark measures.
+**Absolute numbers are host-dependent, so read the ratio, not the floor.** A reranked recall is
+dominated by the cross-encoder (`--candidates` query/passage pairs), identical work on both legs, and
+that floor moves with the CPU and the inference backend. What the benchmark measures is the remote-vs-local
+**ratio**: warm close to local, cold a one-time download.
 
 ## Caveats
 
@@ -99,79 +92,113 @@ second (local ≈ remote-warm ≈ ~1.9 s). The floor moves with the hardware; th
 - For a private dataset, a token must be available (`HF_TOKEN` or the cached login) — the same one
   recall uses.
 
-## Building a benchmark memory
+## `bench_index` — writing an index's rows
 
-The remote target above was built from a public agent-trace dataset with funes' parquet indexer:
-
-```sh
-# 1. fetch the auto-converted parquet (one row per session)
-hf download Glint-Research/Fable-5-traces --repo-type dataset \
-  --revision refs/convert/parquet --include "pi_agent/train/0000.parquet" --local-dir ./traces
-
-# 2. (optional) slice to ~N sessions to hit a target chunk count, then index into an isolated home
-FUNES_HOME=./bench-home funes index ./traces/pi_agent/train/0000.parquet
-
-# 3. publish to a Hub dataset repo you own (create it first; funes won't), which re-materializes a
-#    clean, compact dataset on the remote (--yes accepts the first push to an empty repo)
-hf repo create <org>/<repo> --repo-type dataset
-FUNES_HOME=./bench-home funes push <org>/<repo> --yes
-```
-
-`funes index <file>.parquet` indexes the whole file as a bulk import (one append, so the memory stays
-compact); see `src/traces/parquet.rs`. The push gate redacts/holds back any rows containing secrets before
-upload.
-
-## `bench_index` — index build
-
-`bench_index.rs` times an `index` build into a throwaway `$FUNES_HOME` (your real memory and config
-are untouched; no remote is attached there, so nothing is pushed) and reports build time, embedding
-throughput, and how compact the resulting memory is.
-
-`--sessions <N>` caps how many sessions are indexed (default **500**) so the build doesn't run long
-over a big tree or the full parquet — raise it for a longer, steadier measurement.
+`bench_index.rs` times the part of `funes index` that writes rows, in a scratch memory. It leaves
+the embedding out, since it takes the longest and does not depend on how the rows are written. It
+times writing the rows (reading each turns file, chunking it, appending its rows, recording its
+state), then the end of the run (the language counts and the compaction). Both grow with the number
+of sessions as well as with their size, so a history of many short sessions is where they show.
 
 ```sh
-cargo run --release --example bench_index -- path/to/traces.parquet                 # first 500 sessions
-cargo run --release --example bench_index -- ~/.claude/projects --sessions 100       # a JSONL tree, capped
-cargo run --release --example bench_index -- path/to/traces.parquet --sessions 5000  # longer run
+cargo run --release --example bench_index -- --sessions 2000 2>/dev/null
+cargo run --release --example bench_index -- --dir path/to/turns --limit 5000 2>/dev/null
 ```
 
-Example output:
+The corpus is generated, `--sessions` sessions (2000 by default) of `--turns` turns (12) that are
+the same on every run, or a directory of turns files given with `--dir`, of which `--limit` keeps
+the most recent sessions. The indexer reports each session and the compaction on stderr. The bench
+prints the sessions and chunks written with their time and rate, the fragments the writes left for
+the compaction to merge, then the time the end of the run took.
 
-```
-=== index benchmark ===
-source:           Fable-5-traces.parquet
-elapsed:          385.0s  (incl. model load)
-sessions:         4665
-chunks:           21767
-throughput:       57 chunks/s
-memory size:      53 MB
-lance fragments:  1
-```
+## `bench_models` — embedding and reranking time
 
-The three counts are deliberately distinct granularities: **4665 sessions** chunk into **21767
-chunks**, all written into **1 Lance fragment** (a physical data file). `lance fragments: 1` confirms
-the bulk-import path stayed compact — a regression to per-session appends would show one fragment per
-session and a much larger memory. (That run indexed the whole file; pass a large `--sessions` to do
-likewise — the default 500 builds far faster.) Elapsed includes the one-time embedding-model load,
-so throughput is a slight under-estimate on small inputs.
-
-## `bench_backends` — inference backend comparison
-
-`bench_backends.rs` compares every compiled `Embedder`/`Reranker` implementation. Build with both
-the default BLAS backend and the optional ONNX reference:
+`bench_models.rs` times funes's embedder and reranker (gte-reranker-modernbert-base) on one
+backend: `--backend blas`, the default, runs the CPU forwards every build carries, and
+`--backend metal` the GPU forwards of a macOS build. `--model` names the embedding model,
+`BAAI/bge-small-en-v1.5` when omitted.
 
 ```sh
-cargo run --release --features onnx --example bench_backends
+cargo run --release --example bench_models -- --backend metal
+cargo run --release --example bench_models -- --model intfloat/multilingual-e5-small
 ```
 
-It runs two fixed workloads: 16 short documents to expose per-call overhead, and 30 documents near
-the 512-token truncation limit to approximate recall's rerank worst case. For each backend it reports
-embedding and reranking latency plus agreement with the first backend:
+It times the forwards themselves. funes runs them behind a router that keeps a call on the CPU
+until it holds 32 texts or 8 pairs, and the two backends' startup and first calls are what those
+thresholds weigh. Each model's startup comes first: how long it took to load, then its first call
+on the 32 real documents, which a one-shot process such as `funes recall` pays in full. Then each
+workload's time per call and documents per second, after one warm-up call.
 
-- `embed cos↔ref` is the minimum cosine similarity between corresponding embedding vectors.
-- `rerank Δ↔ref` is the maximum absolute difference between corresponding reranker scores.
+The seven workloads live in `workloads.rs`, which `score_models` shares:
 
-ONNX is the reference when that feature is present. The benchmark has no command-line options; edit
-its fixed query or workloads when investigating a particular regression. Building with only one
-backend still prints its timing, along with a note that there is nothing to compare.
+- 16 short documents, to expose per-call overhead.
+- 30 documents near the 512-token truncation limit, recall's rerank worst case.
+- A ragged batch of 2 capped documents among 14 short ones.
+- 32 and 100 documents whose token lengths are the quantiles of real chunks. 100 is recall's pool
+  at `--candidates 100`.
+- 256-document mixed and real batches, an indexing call's size on the CPU, which show how a backend
+  scales and what it spends on padding.
+
+Edit the query or the workloads when investigating a particular regression.
+
+## `score_models` — the backends against ONNX
+
+`score_models.rs` measures how closely funes's backends reproduce ONNX Runtime running each model's
+ONNX export: the CPU forwards (`blas`) and, in a macOS build, the GPU forwards (`metal`), over the
+same seven workloads. ONNX is the reference, so the example needs it compiled in:
+
+```sh
+cargo run --release --features onnx --example score_models
+cargo run --release --features onnx --example score_models -- --model intfloat/multilingual-e5-small
+```
+
+- `cos↔onnx` is the lowest cosine similarity between a document's embedding on the backend and on
+  ONNX.
+- `Δ↔onnx` is the largest absolute difference between their reranker scores.
+
+## `score_recall` — recall against labeled questions
+
+`score_recall.rs` asks each question of a labeled set with `funes recall`'s defaults and prints the
+receipt: the funes version, the memory's revision and the file's hash, then hit@1, hit@5, found@8,
+the mean reciprocal rank and how many answers are a hit's own turn, overall and by kind, with the
+median reply size and latency, then each question's rank and the turns its reply showed.
+`--candidates` asks from a deeper pool. `--candidates 8` scores the fused order alone, since a pool
+of the hits is not reranked.
+A question is one JSON line with an `id`, the `question`, `gold` (the turns that answer it, each a
+`session_id` and the `turn` within it: the answer and each restatement of it) and an optional `kind`.
+Its rank is the position of its first hit that shows an answering turn, as the hit itself or as a turn
+of the exchange frame attached to it. The labeled sets and their receipts live in the
+[`dacorvo/funes-recall-benchmark`](https://huggingface.co/datasets/dacorvo/funes-recall-benchmark)
+dataset:
+
+```sh
+cargo run --release --example score_recall -- funes-memory/questions.jsonl --memory huggingface/funes-memory
+```
+
+The hits come from the call `funes recall` makes, not from its printed text: a hit's text can quote
+an earlier recall, `→ get` lines included, and nothing in the text tells a quoted hit from a real one.
+A run stops on a degraded read (the Hub unreachable, recall answering from the local memory), since
+those hits were drawn from another memory.
+
+## `sweep_rerank` — how much reranking helps, per pool size
+
+`sweep_rerank.rs` measures how much a rerank helps for different pool sizes, on a set of the
+[`dacorvo/funes-recall-benchmark`](https://huggingface.co/datasets/dacorvo/funes-recall-benchmark)
+dataset's questions: for every question it dumps the fused order of each pool and the reranker's
+score of each candidate, and the dataset's scorers compare the fused order with the reranked order
+at any cut.
+
+```sh
+cargo run --release --example sweep_rerank -- questions.jsonl --memory mem/funes-memory --out sweep.jsonl
+```
+
+For each question and each `--pools` size N (10, 12, 16, 20, 24, 30, 32, 50 and 100 by default) it
+asks `ranked_hits` for N hits from N candidates, the fused order of the pool recall would cut, before
+the exchange frame a recall adds, and
+scores every candidate with funes's own reranker. One JSON line per question and pool: the
+candidates in fused order, each with its fused score and its reranker score, and the retrieval and
+rerank times. By default a question's union of pools is scored in one reranker call and a chunk's
+score looked up by its id (on the GPU, a pair scored the same in every batch that held it, on the
+120 pairs checked). `--per-pool` scores each pool as its own call, as recall does, twice, timing
+the second so no GPU graph is built inside the timing, and `--cpu` also times the CPU reranker. The output is appended to, and a (question, pool) already
+in it is skipped, so an interrupted run resumes. The scorers and the receipts live in the dataset.

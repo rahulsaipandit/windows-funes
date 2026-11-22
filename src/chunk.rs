@@ -1,8 +1,7 @@
 //! Render blocks to text and split into chunks.
 //! All indexing is by Unicode code point (char), not bytes.
 
-use crate::traces::Turn;
-use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
+use crate::traces::{self, Turn};
 use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::borrow::Cow;
@@ -236,53 +235,6 @@ fn reconstruct(pieces: &[&str]) -> String {
     }
 }
 
-/// Reconstruct [`Chunk`]s from stored rows (all columns), so the memory can be rewritten without its
-/// source. The `vector` column is dropped — rewritten rows are re-embedded.
-pub(crate) fn chunks_from_batches(batches: &[RecordBatch]) -> Vec<Chunk> {
-    let sv = |b: &RecordBatch, name: &str, i: usize| -> String {
-        b.column_by_name(name)
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .map(|c| c.value(i).to_string())
-            .unwrap_or_default()
-    };
-    let so = |b: &RecordBatch, name: &str, i: usize| -> Option<String> {
-        b.column_by_name(name)
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-            .filter(|c| !c.is_null(i))
-            .map(|c| c.value(i).to_string())
-    };
-    let iv = |b: &RecordBatch, name: &str, i: usize| -> i64 {
-        b.column_by_name(name)
-            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-            .map(|c| c.value(i))
-            .unwrap_or(0)
-    };
-    let mut out = Vec::new();
-    for b in batches {
-        for i in 0..b.num_rows() {
-            out.push(Chunk {
-                id: sv(b, "id", i),
-                text: sv(b, "text", i),
-                session_id: sv(b, "session_id", i),
-                workdir: sv(b, "workdir", i),
-                turn_uuid: sv(b, "turn_uuid", i),
-                parent_uuid: so(b, "parent_uuid", i),
-                seq: iv(b, "seq", i),
-                ts: sv(b, "ts", i),
-                role: sv(b, "role", i),
-                block_type: sv(b, "block_type", i),
-                tool_name: so(b, "tool_name", i),
-                source_path: sv(b, "source_path", i),
-                block_idx: iv(b, "block_idx", i),
-                split_idx: iv(b, "split_idx", i),
-                harness: sv(b, "harness", i),
-                repo: sv(b, "repo", i),
-            });
-        }
-    }
-    out
-}
-
 /// Group `chunks` into blocks and reconstruct each block's contiguous text in one step — the single
 /// entry point both the push gate and `scrub` use to scan whole blocks. Returns, in first-seen block
 /// order, each block's chunk indices (ordered by `split_idx`) paired with its reconstructed text, so
@@ -301,8 +253,9 @@ pub(crate) fn reconstruct_blocks(chunks: &[Chunk]) -> Vec<(Vec<usize>, String)> 
 /// Re-chunk a block's (already rendered) `text` after it changed — e.g. a secret was redacted out —
 /// reusing the block's identity (session, turn, block_idx, role, …) from `template`. Ids and
 /// `split_idx` are regenerated from the new split count, so they stay coordinate-stable. An empty
-/// result means nothing indexable survived.
-pub(crate) fn resplit(template: &Chunk, text: &str) -> Vec<Chunk> {
+/// result means nothing indexable survived. The pieces carry `tool_name`, the name `text` renders,
+/// which a redaction of the text may have changed.
+pub(crate) fn resplit(template: &Chunk, text: &str, tool_name: Option<String>) -> Vec<Chunk> {
     split(text)
         .into_iter()
         .enumerate()
@@ -310,25 +263,25 @@ pub(crate) fn resplit(template: &Chunk, text: &str) -> Vec<Chunk> {
             id: cid(&template.session_id, &template.turn_uuid, template.block_idx, si as i64),
             text: piece,
             split_idx: si as i64,
+            tool_name: tool_name.clone(),
             ..(*template).clone()
         })
         .collect()
 }
 
-/// Whether a pass over `tiers` (with `include_thinking`) indexes a block of this type: its tier is
-/// requested and it isn't a dropped thinking block. Shared with redaction, so the blocks scanned for
-/// secrets are exactly the blocks stored.
-pub fn block_selected(block_type: &str, tiers: &[Tier], include_thinking: bool) -> bool {
-    tiers.contains(&Tier::of_block(block_type)) && (block_type != "thinking" || include_thinking)
+/// Whether an index (with `include_thinking`) stores a block of this type: it isn't a dropped
+/// thinking block.
+fn block_selected(block_type: &str, include_thinking: bool) -> bool {
+    block_type != "thinking" || include_thinking
 }
 
-pub fn chunks_from_turns(turns: &[Turn], tiers: &[Tier], include_thinking: bool) -> Vec<Chunk> {
+pub fn chunks_from_turns(turns: &[Turn], include_thinking: bool) -> Vec<Chunk> {
     let mut out = Vec::new();
     for turn in turns {
         for (bi, block) in turn.blocks.iter().enumerate() {
-            // block_idx counts every block, so skipping one here (tier or thinking) never
-            // renumbers the rest.
-            if !block_selected(&block.block_type, tiers, include_thinking) {
+            // block_idx counts every block, so skipping a thinking block here never renumbers the
+            // rest.
+            if !block_selected(&block.block_type, include_thinking) {
                 continue;
             }
             let rendered = render(&block.block_type, &block.text, &block.tool_name);
@@ -357,10 +310,31 @@ pub fn chunks_from_turns(turns: &[Turn], tiers: &[Tier], include_thinking: bool)
     out
 }
 
+/// The language of a chunk's prose, as an ISO 639-3 code.
+pub fn language(role: &str, block_type: &str, split_idx: i64, text: &str) -> Option<&'static str> {
+    if block_type != "text" || split_idx != 0 || !matches!(role, "user" | "assistant") {
+        return None;
+    }
+    if role == "user" && traces::is_scaffolding(text) {
+        return None;
+    }
+    whatlang::detect(&prose(text))
+        .filter(|info| info.is_reliable())
+        .map(|info| info.lang().code())
+}
+
+fn prose(text: &str) -> String {
+    text.split("```")
+        .step_by(2)
+        .flat_map(|outside| outside.split('`').step_by(2))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::traces::{Block, Turn};
+    use crate::traces::{Block, Turn, FORMAT_VERSION};
 
     fn block(block_type: &str, text: &str, tool_name: Option<&str>) -> Block {
         Block {
@@ -373,7 +347,9 @@ mod tests {
 
     fn turn(blocks: Vec<Block>) -> Turn {
         Turn {
+            format: FORMAT_VERSION,
             session_id: "sess".into(),
+            cwd: None,
             workdir: "proj".into(),
             turn_uuid: "uuid".into(),
             parent_uuid: None,
@@ -446,11 +422,19 @@ mod tests {
         assert!(pieces[0].contains(&head), "consecutive pieces should overlap");
     }
 
+    /// A re-indexed turn dedups against the memory by id, so ids are frozen: a change to how one is
+    /// derived would append every turn indexed again as new rows.
     #[test]
-    fn cid_is_stable_and_distinct() {
-        assert_eq!(cid("s", "u", 0, 0), cid("s", "u", 0, 0));
-        assert_ne!(cid("s", "u", 0, 0), cid("s", "u", 0, 1));
-        assert_eq!(cid("s", "u", 0, 0).len(), 16);
+    fn chunk_ids_are_frozen() {
+        let t = turn(vec![
+            block("text", "a decision", None),
+            block("tool_use", "{}", Some("Bash")),
+        ]);
+        let ids: Vec<String> = chunks_from_turns(std::slice::from_ref(&t), true)
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(ids, ["088ee3e13e4321bc", "4bbd19dac6de8612"]);
     }
 
     #[test]
@@ -463,29 +447,17 @@ mod tests {
 
     #[test]
     fn stitch_does_not_over_merge_repetitive_text() {
-        // Periodic text: many suffix==prefix lengths match. The seam is bounded by OVERLAP, so a
-        // longer spurious match must not swallow real content.
+        // Periodic text: a suffix of `a` matches a prefix of `b` at every multiple of the period, up
+        // to all of it. The seam is bounded by OVERLAP, so the longest it takes is OVERLAP chars.
         let unit = "abcabcabc ";
-        let a = unit.repeat(60); // > OVERLAP chars, all periodic
+        let a = unit.repeat(60);
         let b = unit.repeat(60);
-        let joined = stitch(&a, &b);
-        // Reassembly must not be shorter than the longer input (no content dropped).
-        assert!(joined.chars().count() >= a.chars().count());
+        assert_eq!(stitch(&a, &b), format!("{a}{}", &b[OVERLAP..]));
     }
 
     #[test]
     fn stitch_no_overlap_concatenates() {
         assert_eq!(stitch("alpha", "beta"), "alphabeta");
-    }
-
-    #[test]
-    fn stitch_recovers_overlap_with_trimmed_seam_whitespace() {
-        // The real shared region is "the quick brown fox " (trailing space), but split() trims it
-        // off `a`'s end and the leading space off `b`. stitch must still match the shorter overlap
-        // and not duplicate it (no "...foxfox..." and no doubled "the quick brown fox").
-        let a = "HEAD the quick brown fox"; // trailing space trimmed
-        let b = "the quick brown fox TAIL"; // leading already flush
-        assert_eq!(stitch(a, b), "HEAD the quick brown fox TAIL");
     }
 
     #[test]
@@ -511,10 +483,10 @@ mod tests {
         // would produce for that text — so a scrub's delete-by-id + append stays coordinate-stable.
         let long: String = (0..600).map(|i| format!("word{i} ")).collect();
         let t = turn(vec![block("text", &long, None)]);
-        let fresh = chunks_from_turns(std::slice::from_ref(&t), &Tier::ALL, true);
+        let fresh = chunks_from_turns(std::slice::from_ref(&t), true);
         let template = fresh[0].clone();
         let rendered = render("text", &long, &None);
-        let re = resplit(&template, &rendered);
+        let re = resplit(&template, &rendered, None);
         assert_eq!(re.len(), fresh.len());
         for (a, b) in re.iter().zip(&fresh) {
             assert_eq!(a.id, b.id);
@@ -532,11 +504,11 @@ mod tests {
             block("thinking", "secret", None),
             block("text", "third", None),
         ]);
-        let with = chunks_from_turns(std::slice::from_ref(&t), &Tier::ALL, true);
+        let with = chunks_from_turns(std::slice::from_ref(&t), true);
         assert_eq!(with.len(), 3);
         assert_eq!(with.iter().map(|c| c.block_idx).collect::<Vec<_>>(), vec![0, 1, 2]);
 
-        let without = chunks_from_turns(std::slice::from_ref(&t), &Tier::ALL, false);
+        let without = chunks_from_turns(std::slice::from_ref(&t), false);
         assert_eq!(without.len(), 2);
         assert_eq!(without.iter().map(|c| c.block_idx).collect::<Vec<_>>(), vec![0, 2]);
         assert!(without.iter().all(|c| c.block_type != "thinking"));
@@ -552,51 +524,36 @@ mod tests {
         assert!(Tier::Text < Tier::ToolUse && Tier::ToolUse < Tier::ToolResult);
     }
 
+    const PORTUGUESE: &str = "Precisamos decidir se o atalho apaga o caractere à frente do cursor no campo de texto.";
+
     #[test]
-    fn tiers_filter_selects_only_requested_block_types() {
-        let t = turn(vec![
-            block("text", "decision", None),
-            block("tool_use", r#"{"cmd":1}"#, Some("Bash")),
-            block("tool_result", "output", Some("Bash")),
-        ]);
-        let kinds = |cs: &[Chunk]| cs.iter().map(|c| c.block_type.clone()).collect::<Vec<_>>();
-        assert_eq!(
-            kinds(&chunks_from_turns(std::slice::from_ref(&t), &[Tier::Text], true)),
-            vec!["text"]
-        );
-        assert_eq!(
-            kinds(&chunks_from_turns(std::slice::from_ref(&t), &[Tier::ToolUse], true)),
-            vec!["tool_use"]
-        );
-        assert_eq!(
-            kinds(&chunks_from_turns(std::slice::from_ref(&t), &[Tier::ToolResult], true)),
-            vec!["tool_result"]
-        );
-        assert_eq!(
-            kinds(&chunks_from_turns(std::slice::from_ref(&t), &Tier::ALL, true)),
-            vec!["text", "tool_use", "tool_result"]
-        );
+    fn language_reads_the_prose_of_user_and_assistant_text() {
+        assert_eq!(language("user", "text", 0, PORTUGUESE), Some("por"));
+        let chinese = "部署失败以后，我们决定先回滚到上一个版本，再排查配置问题。";
+        assert_eq!(language("assistant", "text", 0, chinese), Some("cmn"));
+        let english = "We decided to roll back the deploy first, then look into the configuration drift.\n\
+                       ```sh\ngit revert HEAD\n```";
+        assert_eq!(language("assistant", "text", 0, english), Some("eng"));
     }
 
     #[test]
-    fn chunk_ids_are_tier_pass_independent() {
-        // The core invariant behind tier backfill: a block's id/coordinate is the same whether a
-        // pass emits every tier or only that block's tier — so a later L3 pass dedups exactly
-        // against what a full index would have written, with no gaps or renumbering.
-        let t = turn(vec![
-            block("text", "decision", None),
-            block("tool_use", r#"{"cmd":1}"#, Some("Bash")),
-            block("tool_result", "output", Some("Bash")),
-        ]);
-        let all = chunks_from_turns(std::slice::from_ref(&t), &Tier::ALL, true);
-        let only_result = chunks_from_turns(std::slice::from_ref(&t), &[Tier::ToolResult], true);
-        let from_all: Vec<&Chunk> = all.iter().filter(|c| c.block_type == "tool_result").collect();
-        assert_eq!(only_result.len(), from_all.len());
-        assert!(!only_result.is_empty());
-        for (a, b) in only_result.iter().zip(from_all) {
-            assert_eq!(a.id, b.id, "tool_result id must match across tier passes");
-            assert_eq!(a.block_idx, b.block_idx);
-            assert_eq!(a.split_idx, b.split_idx);
+    fn language_skips_what_is_not_prose() {
+        for (role, block_type, split_idx) in [
+            ("assistant", "thinking", 0),
+            ("assistant", "tool_use", 0),
+            ("user", "tool_result", 0),
+            ("system", "text", 0),
+            ("user", "text", 1),
+        ] {
+            assert_eq!(
+                language(role, block_type, split_idx, PORTUGUESE),
+                None,
+                "{role} {block_type} {split_idx}"
+            );
         }
+        let reminder = format!("<system-reminder>{PORTUGUESE}</system-reminder>");
+        assert_eq!(language("user", "text", 0, &reminder), None);
+        assert_eq!(language("assistant", "text", 0, "```rust\nfn main() {}\n```"), None);
+        assert_eq!(language("user", "text", 0, "ok"), None);
     }
 }

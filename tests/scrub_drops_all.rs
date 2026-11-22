@@ -3,6 +3,7 @@
 //! all-dropped path that the mixed-block test does not. Skipped unless trufflehog and ssh-keygen
 //! are available.
 
+use funes::home;
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -43,32 +44,33 @@ async fn scrub_dropping_every_block_leaves_a_valid_empty_memory() {
     };
 
     // A single session, a single block — the unredactable key and nothing else. Scrub drops it all.
-    let workdir = "-home-u-dev-demo";
     let session = "scrub-all-0001";
-    let dir = source.path().join("projects").join(workdir);
-    std::fs::create_dir_all(&dir).unwrap();
+
     let line = serde_json::json!({
-        "type": "user",
-        "uuid": "t1",
-        "timestamp": "2026-01-01T00:00:00Z",
-        "message": {"role": "user", "content": format!("deploy key: {blob}")},
+        "format": 1,
+        "session_id": session,
+        "cwd": "/home/u/dev/demo",
+        "turn_uuid": "t1",
+        "seq": 0,
+        "ts": "2026-01-01T00:00:00Z",
+        "role": "user",
+        "blocks": [{"block_type": "text", "text": format!("deploy key: {blob}")}],
+        "harness": "claude",
     })
     .to_string();
-    let mut f = std::fs::File::create(dir.join(format!("{session}.jsonl"))).unwrap();
+    let mut f = std::fs::File::create(source.path().join(format!("{session}.funes.jsonl"))).unwrap();
     writeln!(f, "{line}").unwrap();
 
-    // Index with a no-op scanner so the escaped key lands in the memory unredacted.
-    std::env::set_var("FUNES_TRUFFLEHOG", "/usr/bin/true");
+    // Indexing stores the escaped key as written.
     funes::commands::index::run_index(source.path(), false, None)
         .await
         .unwrap();
 
-    // Scrub with the real scanner: every block is unredactable, so the memory is rewritten empty.
-    std::env::remove_var("FUNES_TRUFFLEHOG");
+    // Every block is unredactable, so scrub rewrites the memory empty.
     funes::commands::scrub::run().await.unwrap();
 
     // The empty Overwrite must leave a valid, reopenable memory with zero rows.
-    let uri = funes::memory::dataset::table_uri(&funes::memory::dataset::local_memory_dir());
+    let uri = funes::memory::dataset::table_uri(home::memory_dir());
     let ds = funes::memory::dataset::open(&uri, HashMap::new())
         .await
         .expect("memory must reopen after an all-dropped scrub");

@@ -7,4 +7,9 @@ fn main() {
     if blas && target_os == "macos" {
         println!("cargo:rustc-link-lib=framework=Accelerate");
     }
+    // Windows port: the main thread gets 1 MB on Windows against 8 MB on Linux/macOS, and the
+    // indexing path (embedding + lance) overflows it. Match the unix default for the binaries.
+    if target_os == "windows" && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/STACK:8388608");
+    }
 }

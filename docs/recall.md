@@ -9,9 +9,19 @@ them on its own — but they work the same from a terminal.
 funes recall "why did we switch off the streaming parser"
 ```
 
-Retrieval is one pipeline: hybrid search (vector + BM25, fused by reciprocal rank) → cross-encoder
-rerank → recency reweight → neighbor expansion. What comes back is the **actual passage from the
-actual turn**, not a summary written about it.
+Retrieval is one pipeline. A hybrid search (vector + BM25, fused by reciprocal rank) runs for each
+block type, as deep as the pool, and each type gets an equal share of the pool. The default 30
+candidates hold 7 or 8 rows of each of the four types. The extra rows go to the types whose next
+row ranks higher. A type with fewer matches leaves the rest of its share to the others, and `--type`
+gives the whole pool to one type. When the pool holds more rows than the hits asked for, a
+cross-encoder reranks it before the cut. What comes back is the **actual passage from the actual
+turn**, not a summary written about it.
+
+A query matches best in the language of the sessions it looks for. `funes status` lists the
+languages a memory's sessions are written in.
+
+Passages are searchable by their words as soon as their text is indexed, even while embeddings
+are pending. If text search fails, recall reports an error.
 
 `funes recall` prints one stable, parseable layout — the **agent format** — everywhere, terminal or
 pipe. It's shaped for an agent to read, but it's the raw evidence for you too. If you want an
@@ -26,30 +36,64 @@ Each hit carries its provenance and a ready-to-run drill-down line:
 
 ```
 [<ts>] <harness> <workdir>/<session8> <block_type>  score=<s.sss>
-  → get <session_id> --from <seq> --to <seq> --memory <label>
+  → get <session_id> --from <seq> --to <seq>[ --memory <memory>]
 <the full chunk text>
-  ~ [<role> <block_type> seq<N>] <neighbor chunk, first 160 chars>
+  ↳ [<role> text seq<N>]
+<a turn of the hit's exchange, in full>
 ---
 ```
 
-The `→ get` line carries exactly the arguments `get` wants, including the memory the hits were read
-from. `no results` prints when nothing matched. The exact shape is stable — a contract, not a
-presentation; don't parse it loosely.
+The `↳` turns are the hit's exchange: the user prompt that opened it, the assistant's last text
+before the next prompt and that next prompt, in session order, each attached once per reply even
+when several hits share an exchange. They are where the answer usually is: the hit is the chunk that
+matched the question, the final text is the assistant's word on it, the next prompt the user's.
+
+After the last hit, one line says what to try when the hits miss: rephrase in the words the hits
+use, or in a language detected in the searched memories when they hold more than English, then
+raise `--k`. A `→ get` line reads the turns around its own hit, so it helps once a hit answers,
+not to look for an answer the hits missed.
+
+The `→ get` line carries exactly the arguments `get` wants, `--memory` included when the call
+named one, as it named it, so the drill-down reads what the search read; a call naming none gets
+a bare line, and following it reads the same way. `no results` prints when nothing matched,
+followed by the advice to rephrase in the searched memories' languages when they hold more than
+English. The exact shape is stable — a contract, not a presentation; don't parse it loosely.
+The score is the cross-encoder's probability when the pool was reranked, the fused rank score
+otherwise (see `--candidates` below).
+
+`--oneline` prints one row per hit instead: the header and the `→ get` target joined, then the
+hit's first 120 characters flattened onto the line, and no passage. It is for choosing what to
+read: a listing of eight hits costs a few hundred tokens where each passage costs that much on its
+own. The row is as stable as the agent format.
+
+```
+[<ts>] <harness> <workdir>/<session8> <block_type>  score=<s.sss>  → get <session_id> --from <seq> --to <seq>[ --memory <memory>] · <first 120 chars>
+```
 
 ## `recall` flags
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `-k` | 8 | hits returned |
-| `--candidates` | 30 | fused pool reranked before the top-k cut |
-| `--half-life` | 30 | recency decay in days (a hit this old keeps half its weight); 0 disables |
-| `--neighbors` | 1 | adjacent chunks (by seq) attached per hit; 0 disables |
+| `-k` | 8 | hits returned, each a passage to read |
+| `--candidates` | 30 | fused pool the hits are cut from, reranked by the cross-encoder before the cut when it holds more than `-k` rows |
+| `--oneline` | off | one row per hit: provenance, `→ get` target and opening words, no passage |
 | `--type` | — | restrict to `text \| thinking \| tool_use \| tool_result` |
-| `--harness` | — | restrict to `claude \| codex \| pi \| hermes` |
-| `--memory` | local | the memory to read (see below) |
+| `--role` | — | restrict to one role, as the turns carry it (an agent's turns say `user \| assistant \| tool \| system`) |
+| `--harness` | — | restrict to one harness facet, as the turns carry it (`claude` also matches the older `claude_code`) |
+| `--repo` | — | restrict to turns whose checkout resolved to this `owner/name` |
+| `--since` / `--until` | — | restrict to turns on or after / on or before a `YYYY-MM-DD` |
+| `--memory` | the bound memory, else local | the memory to read, as it stands (see below) |
 
-The MCP `recall` tool takes the same parameters and defaults, so an agent can widen a search —
-`half_life: 0` when the answer may be old.
+The MCP `recall` tool takes the same parameters and defaults. Each hit is a passage to read, so
+`k` is what a call costs in tokens and `candidates` is how far it looks. A pool larger than the
+hits is reranked with the cross-encoder before the cut, which costs seconds per call and grows with
+the pool, so `candidates` can grow while `k` stays small. A pool of `k` rows or fewer is read whole,
+in the fused order. Ranking weighs relevance, not age: for the latest
+word on a topic, pass `since`. A memory spans every repo its sessions ran in, so a question in
+general words can return passages from another project: `--repo` keeps to one. A checkout names
+all its remotes, so a fork's turns match its upstream too, and a turn whose checkout did not
+resolve matches no repo. Tool output is a `tool_result` block whatever the turn's role, and
+in Claude's sessions it arrives on `user` turns, so the user's own words are `--role user --type text`.
 
 ## Reading turns with `get`
 
@@ -58,7 +102,8 @@ funes get <session_id> [--from <seq>] [--to <seq>] [--memory <label>]
 ```
 
 `get` returns a range of a session's turns, with their splits reassembled into whole blocks. Pass the
-same `--memory` the recall hint named, so the drill-down reads the memory the hit came from. The
+`--memory` the recall hint carries, or none when it carries none, so the drill-down reads what the
+search read. The
 output is the agent format, the same in a terminal as when piped.
 
 Turns are addressed by `seq`, the session's own dense counter over its turns, so `--from 40 --to 60`
@@ -88,8 +133,11 @@ when the id is unknown.
 
 ## Reading a different memory
 
-`--memory` takes an `<org>/<repo>` shorthand, a full `hf://…` URI, a local path, or `local`. This is
-how you read a **shared** memory without changing your own setup:
+Without `--memory`, a read is of the memory this host is bound to
+([add.md](add.md#binding-a-memory)), as it will be after the next push: its rows, and this host's
+turns not pushed yet; on a host bound to nothing, the local memory. `--memory` names a memory to
+read as it stands — an `<org>/<repo>` shorthand, a full `hf://…` URI, a local path, or `local` for
+this host's memory alone. This is how you read a **shared** memory without changing your own setup:
 
 ```bash
 funes recall "why is funes append-only" --memory huggingface/funes-memory

@@ -3,41 +3,60 @@
 //! stdout is the JSON-RPC channel — logs must go to stderr.
 
 use super::recall;
-use crate::memory::Memory;
+use super::target::Target;
+use crate::agents;
 use anyhow::Result;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{Implementation, ProtocolVersion, ServerCapabilities, ServerInfo};
+use rmcp::model::{Implementation, ServerCapabilities, ServerConfig};
 use rmcp::transport::stdio;
 use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 
+// A request refuses a parameter its schema does not list: an agent reading the schema never sends
+// one, so an unknown field is the caller's bug, failed with the field named rather than ignored.
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RecallRequest {
-    #[schemars(description = "Natural-language description of what to recall from past sessions")]
+    #[schemars(
+        description = "Natural-language description of what to recall from past sessions. A query matches best in the language they are written in, which `status` reports."
+    )]
     pub query: String,
-    #[schemars(description = "Number of results to return")]
+    #[schemars(
+        description = "Hits returned (default 8). Each is a verbatim passage of a few hundred tokens, so `k` is what a call costs to read."
+    )]
     pub k: Option<usize>,
     #[schemars(
-        description = "Recency half-life in days: a hit that old keeps half its score. Pass 0 to weigh every age alike, for a memory spanning months or an answer that may be old."
+        description = "One row per hit, no passage: the provenance, the `→ get` target and the hit's opening words. For choosing what to read before a `get`, at a fraction of the tokens."
     )]
-    pub half_life: Option<f64>,
-    #[schemars(description = "Adjacent chunks attached to each hit for context; 0 returns the hits alone.")]
-    pub neighbors: Option<i64>,
+    pub oneline: Option<bool>,
     #[schemars(
-        description = "How many fused candidates to rerank. Raise it when a topic is rare and the first pass may not surface it."
+        description = "Size of the fused pool the hits are cut from (default 30): how far the search looks. Larger than `k`, the pool is reranked by the cross-encoder before the cut, which costs seconds and grows with the pool, so `k` can stay small while the search looks deep. A pool of `k` rows or fewer is read whole, in the fused order."
     )]
     pub candidates: Option<usize>,
     #[schemars(description = "Restrict to a block type: text | thinking | tool_use | tool_result")]
     pub block_type: Option<String>,
-    #[schemars(description = "Restrict to a harness: claude | codex | pi | hermes")]
-    pub harness: Option<String>,
     #[schemars(
-        description = "Memory to read for this call — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory."
+        description = "Restrict to a role, as the turns carry it (an agent's turns say user | assistant | tool | system)"
+    )]
+    pub role: Option<String>,
+    #[schemars(
+        description = "Restrict to a harness facet, as the turns carry it (`claude` also matches the older `claude_code`)"
+    )]
+    pub harness: Option<String>,
+    #[schemars(description = "Restrict to turns whose checkout resolved to this repo, as `owner/name`")]
+    pub repo: Option<String>,
+    #[schemars(description = "Restrict to turns on or after this date, `YYYY-MM-DD`")]
+    pub since: Option<String>,
+    #[schemars(description = "Restrict to turns on or before this date, `YYYY-MM-DD`")]
+    pub until: Option<String>,
+    #[schemars(
+        description = "Memory to read for this call, as it stands — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Omitted, the server's memory, with this host's turns not yet pushed to it when the host is bound to it."
     )]
     pub memory: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct GetRequest {
     #[schemars(description = "Session id from a recall hit's `→ get` line")]
     pub session_id: String,
@@ -50,12 +69,13 @@ pub struct GetRequest {
     )]
     pub to: Option<i64>,
     #[schemars(
-        description = "Memory to read for this call — the one the recall hit's `→ get` line names. Defaults to the server's memory."
+        description = "Memory to read for this call, as it stands — the one the hit's `→ get` line carries, and none when it carries none, so the drill-down reads what the search read. Omitted, the server's memory, where a session this host has not finished pushing is read from the local memory."
     )]
     pub memory: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionsRequest {
     #[schemars(description = "Keep only sessions whose checkout resolved to this repo, as `owner/name`")]
     pub repo: Option<String>,
@@ -72,12 +92,13 @@ pub struct SessionsRequest {
     )]
     pub offset: Option<usize>,
     #[schemars(
-        description = "Memory to list — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory."
+        description = "Memory to list, as it stands — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Omitted, the server's memory, with the sessions this host has not finished pushing listed from the local memory when the host is bound to it."
     )]
     pub memory: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ScanRequest {
     #[schemars(
         description = "The literal string to find. Not regex — a pattern that silently matched nothing would read as a clean result."
@@ -96,12 +117,13 @@ pub struct ScanRequest {
     #[schemars(description = "Characters of surrounding text shown on each side of a match")]
     pub context: Option<usize>,
     #[schemars(
-        description = "Memory to scan — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory."
+        description = "Memory to scan, as it stands — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Omitted, the server's memory, where a session this host has not finished pushing is read from the local memory."
     )]
     pub memory: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SketchRequest {
     #[schemars(description = "Session to digest — the id from a `sessions` row or a hit's `→ get` line")]
     pub session_id: String,
@@ -120,23 +142,34 @@ pub struct SketchRequest {
     #[schemars(description = "Last turn to digest, as the session's own seq.")]
     pub to: Option<i64>,
     #[schemars(
-        description = "Memory to read for this call — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory."
+        description = "Memory to read for this call, as it stands — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Omitted, the server's memory, where a session this host has not finished pushing is read from the local memory."
     )]
     pub memory: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StatusRequest {
     #[schemars(
-        description = "Memory to inspect — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Defaults to the server's memory."
+        description = "Memory to inspect — `<org>/<repo>`, an `hf://…` URI, a local path, or `local`. Omitted, the server's memory."
     )]
     pub memory: Option<String>,
 }
 
+/// A tool's text, led by the stale-install note when there is one. A tool result is the one channel
+/// every client hands to the model, so this is where an install that stopped capturing gets said;
+/// the CLI prints the same line on stderr and keeps stdout byte-identical to this text.
+fn noted(text: String) -> String {
+    match agents::stale_install_notice() {
+        Some(note) => format!("{note}\n{text}"),
+        None => text,
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Funes {
-    /// Explicit memory spec (`funes mcp <memory>`), pinned for the server's lifetime. `None` reads
-    /// the local memory unless a call passes its own `memory`.
+    /// The memory the server was started on (`funes mcp <memory>`), read by every call naming
+    /// none; `None` leaves those calls to the host's binding, as on the CLI.
     memory: Option<String>,
     #[allow(dead_code)]
     tool_router: ToolRouter<Funes>,
@@ -151,44 +184,59 @@ impl Funes {
         }
     }
 
-    /// The memory a call reads: its explicit `memory` argument wins over the server's `<memory>`,
-    /// else the local memory.
-    fn memory(&self, spec: Option<String>) -> Memory {
-        Memory::resolve(spec.filter(|s| !s.trim().is_empty()).or_else(|| self.memory.clone()))
+    /// What a call reads: the memory it names, as it stands; naming none, the server's.
+    fn target(&self, spec: Option<String>) -> Result<Target> {
+        match spec.filter(|s| !s.trim().is_empty()) {
+            Some(spec) => Target::resolve(Some(&spec)),
+            None => Target::served(self.memory.as_deref()),
+        }
     }
 
     #[tool(
-        description = "Semantic search over the user's past AI agent sessions: describe what you are after, get back the verbatim passages — what was decided, tried, measured or investigated. Call it when they refer to earlier work, or when you are about to re-derive something a session may already have settled. Call it too before claiming that something was never built, was dropped, or was never discussed: the code cannot show that, only the sessions can. Ranked top-k, so it gives you a foothold on a topic, not every session touching it."
+        description = "Semantic search over the user's past AI agent sessions: describe what you are after, get back the verbatim passages — what was decided, tried, measured or investigated. Call it when they refer to earlier work, or when you are about to re-derive something a session may already have settled. Call it too before claiming that something was never built, was dropped, or was never discussed: the code cannot show that, only the sessions can. Ranked top-k, so it gives you a foothold on a topic, not every session touching it. Ranking weighs relevance, not age: for the latest word on a topic, or one stretch of time, bound it with `since`/`until`. Each hit is a passage framed by its exchange, the prompt that asked, the assistant's last word on it and the user's reply, so the answer is usually in the reply itself: `k` is the token cost, `candidates` the reach, and a pool larger than `k` is reranked, at seconds of latency that grow with the pool, so the reach can grow without the reading. `oneline` lists the hits without their passages, to choose what to read."
     )]
     async fn recall(
         &self,
         Parameters(RecallRequest {
             query,
             k,
-            half_life,
-            neighbors,
+            oneline,
             candidates,
             block_type,
+            role,
             harness,
+            repo,
+            since,
+            until,
             memory,
         }): Parameters<RecallRequest>,
     ) -> String {
-        match recall::recall(
-            self.memory(memory),
-            query,
-            k.unwrap_or(recall::DEFAULT_K),
-            candidates.unwrap_or(recall::DEFAULT_CANDIDATES),
-            half_life.unwrap_or(recall::DEFAULT_HALF_LIFE),
-            neighbors.unwrap_or(recall::DEFAULT_NEIGHBORS),
-            block_type,
-            harness,
+        noted(
+            match async {
+                recall::recall(
+                    self.target(memory)?,
+                    query,
+                    k.unwrap_or(recall::DEFAULT_K),
+                    candidates.unwrap_or(recall::DEFAULT_CANDIDATES),
+                    recall::RecallFilter {
+                        block_type,
+                        role,
+                        harness,
+                        repo,
+                        since,
+                        until,
+                    },
+                    oneline.unwrap_or(false),
+                )
+                .await
+            }
+            .await
+            {
+                Ok(s) if !s.is_empty() => s,
+                Ok(_) => "no results".to_string(),
+                Err(e) => format!("recall error: {e}"),
+            },
         )
-        .await
-        {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => "no results".to_string(),
-            Err(e) => format!("recall error: {e}"),
-        }
     }
 
     #[tool(
@@ -204,15 +252,17 @@ impl Funes {
         }): Parameters<GetRequest>,
     ) -> String {
         let range = recall::TurnRange { from, to };
-        match recall::get(self.memory(memory), session_id, range).await {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => "no results".to_string(),
-            Err(e) => format!("get error: {e}"),
-        }
+        noted(
+            match async { recall::get(self.target(memory)?, session_id, range).await }.await {
+                Ok(s) if !s.is_empty() => s,
+                Ok(_) => "no results".to_string(),
+                Err(e) => format!("get error: {e}"),
+            },
+        )
     }
 
     #[tool(
-        description = "Enumerate a memory's sessions, oldest first. Metadata only — date, harness, repo, turn count, id, and the prompt each opened with, which is the ask a session started from, not what it became. Filter by repo or date to get the session ids the other verbs take; a whole memory can run to thousands of rows."
+        description = "Enumerate a memory's sessions, oldest first. Metadata only — when it started and when its last indexed turn was, harness, repo, turn count, id, and the prompt each opened with, which is the ask a session started from, not what it became. Filter by repo or date to get the session ids the other verbs take; a whole memory can run to thousands of rows."
     )]
     async fn sessions(
         &self,
@@ -232,11 +282,13 @@ impl Funes {
             limit,
             offset: offset.unwrap_or(0),
         };
-        match recall::sessions(self.memory(memory), filter).await {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => "no results".to_string(),
-            Err(e) => format!("sessions error: {e}"),
-        }
+        noted(
+            match async { recall::sessions(self.target(memory)?, filter).await }.await {
+                Ok(s) if !s.is_empty() => s,
+                Ok(_) => "no results".to_string(),
+                Err(e) => format!("sessions error: {e}"),
+            },
+        )
     }
 
     #[tool(
@@ -254,21 +306,26 @@ impl Funes {
             memory,
         }): Parameters<ScanRequest>,
     ) -> String {
-        match recall::scan(
-            self.memory(memory),
-            needle,
-            session_id,
-            from,
-            to,
-            ignore_case.unwrap_or(false),
-            context.unwrap_or(recall::DEFAULT_CONTEXT),
+        noted(
+            match async {
+                recall::scan(
+                    self.target(memory)?,
+                    needle,
+                    session_id,
+                    from,
+                    to,
+                    ignore_case.unwrap_or(false),
+                    context.unwrap_or(recall::DEFAULT_CONTEXT),
+                )
+                .await
+            }
+            .await
+            {
+                Ok(s) if !s.is_empty() => s,
+                Ok(_) => "no results".to_string(),
+                Err(e) => format!("scan error: {e}"),
+            },
         )
-        .await
-        {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => "no results".to_string(),
-            Err(e) => format!("scan error: {e}"),
-        }
     }
 
     #[tool(
@@ -285,40 +342,47 @@ impl Funes {
             memory,
         }): Parameters<SketchRequest>,
     ) -> String {
-        match super::sketch::run(self.memory(memory), session_id, from, to, units, max_chars).await {
-            Ok(s) if !s.is_empty() => s,
-            Ok(_) => "no results".to_string(),
-            Err(e) => format!("sketch error: {e}"),
-        }
+        noted(
+            match async { super::sketch::run(self.target(memory)?, session_id, from, to, units, max_chars).await }.await
+            {
+                Ok(s) if !s.is_empty() => s,
+                Ok(_) => "no results".to_string(),
+                Err(e) => format!("sketch error: {e}"),
+            },
+        )
     }
 
     #[tool(
-        description = "Health and size of a memory: how much is indexed, what is still pending, and for a remote what this host has yet to push. Call it when a read comes back empty or thinner than expected — it says whether the memory is the problem rather than the call."
+        description = "Health and size of a memory: indexed chunks, the languages its sessions are written in, local chunks awaiting embedding, source sessions awaiting indexing, and for a remote this host pushes to what it has yet to push. Call it when a read comes back empty or thinner than expected — it says whether the memory is the problem rather than the call."
     )]
     async fn status(&self, Parameters(StatusRequest { memory }): Parameters<StatusRequest>) -> String {
         // No update check here: it needs the network, and the "update available" notice belongs
         // on the human-facing CLI `funes status`, not on this hot, otherwise-local tool path.
-        recall::status(self.memory(memory))
-            .await
-            .unwrap_or_else(|e| format!("status error: {e}"))
+        noted(
+            async { recall::status(self.target(memory)?).await }
+                .await
+                .unwrap_or_else(|e| format!("status error: {e}")),
+        )
     }
 }
 
 #[tool_handler]
 impl ServerHandler for Funes {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let mut server_info = Implementation::default();
         server_info.name = "funes".to_string();
         server_info.version = env!("CARGO_PKG_VERSION").to_string();
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        let mut instructions = "Persistent memory over the user's past AI coding sessions: their transcripts, \
+                                indexed automatically as they work and read-only here — nothing has to be saved. \
+                                When earlier work matters, this is the memory to consult."
+            .to_string();
+        if let Some(note) = agents::stale_install_notice() {
+            instructions.push_str("\n\n");
+            instructions.push_str(&note);
+        }
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(server_info)
-            .with_protocol_version(ProtocolVersion::V_2024_11_05)
-            .with_instructions(
-                "Persistent memory over the user's past AI coding sessions: their transcripts, \
-                 indexed automatically as they work and read-only here — nothing has to be saved. \
-                 When earlier work matters, this is the memory to consult."
-                    .to_string(),
-            )
+            .with_instructions(instructions)
     }
 }
 
@@ -326,4 +390,21 @@ pub async fn run(memory: Option<String>) -> Result<()> {
     let service = Funes::new(memory).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_request_refuses_a_parameter_its_schema_does_not_list() {
+        let err = serde_json::from_value::<RecallRequest>(serde_json::json!({"query": "x", "neighbors": 0}))
+            .expect_err("a retired parameter must fail the call");
+        assert!(err.to_string().contains("unknown field `neighbors`"), "got: {err}");
+        let err = serde_json::from_value::<GetRequest>(serde_json::json!({"session_id": "s", "form": 3}))
+            .expect_err("a misspelled parameter must fail the call");
+        assert!(err.to_string().contains("unknown field `form`"), "got: {err}");
+        serde_json::from_value::<RecallRequest>(serde_json::json!({"query": "x", "oneline": true}))
+            .expect("a listed parameter parses");
+    }
 }

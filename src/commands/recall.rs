@@ -1,26 +1,29 @@
 //! The read surface: `recall`, `get`, `status` over the existing index.
-//! Recall pipeline: hybrid (vector + BM25, fused by reciprocal rank) → cross-encoder rerank →
-//! recency reweight → neighbor expansion. `recall`/`get` return results rendered in the agent
-//! format; `recall_hits`/`get_turns` return the structured results for other renderings
-//! (see `render`).
+//! Recall pipeline: a hybrid search (vector + BM25, fused by reciprocal rank) for each block type,
+//! each type an equal share of the pool, and a cross-encoder rerank of the pool before the cut when
+//! it holds more rows than the hits ([`reranks`]).
+//! `recall`/`get` return results rendered in the agent format;
+//! `recall_hits`/`get_turns` return the structured results for other renderings (see `render`).
 
+use super::push;
+use super::target::Target;
 use crate::chunk;
-use crate::inference::{self, Embedder, Reranker};
-use crate::memory::dataset;
+use crate::inference::{self, Embedder, EmbeddingModel, Reranker};
+use crate::memory::dataset::{self, RecordBatch};
 use crate::memory::{Memory, MemoryState};
-use crate::traces::harness::Harness;
+use crate::traces;
 use anyhow::{anyhow, bail, Context, Result};
-use arrow_array::{Float32Array, Int64Array, RecordBatch, StringArray, UInt64Array};
-use chrono::{DateTime, Utc};
-use futures::TryStreamExt;
-use lance::dataset::{Dataset, ROW_ID};
-use lance_index::scalar::FullTextSearchQuery;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use chrono::{DateTime, NaiveDate, Utc};
+use lance::Dataset;
+use std::cmp::Reverse;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use tokio::sync::{Mutex, OnceCell};
 
 /// Columns a [`Hit`] needs from a search scan.
 const HIT_COLS: &[&str] = &[
+    "id",
     "text",
     "session_id",
     "workdir",
@@ -31,22 +34,19 @@ const HIT_COLS: &[&str] = &[
     "harness",
 ];
 
-/// Scanned row for neighbor expansion: (session_id, seq, turn_uuid, block_idx, split_idx, role, block_type, text).
-type NeighborRow = (String, i64, String, i64, i64, String, String, String);
-
 /// Scanned row for `get`: (seq, turn_uuid, ts, role, block_idx, split_idx, text).
 type TurnRow = (i64, String, String, String, i64, i64, String);
 
-/// One adjacent chunk pulled in to give a hit some surrounding context.
-pub struct Neighbor {
+/// One prose turn of the exchange framing a hit, attached in full.
+pub struct ExchangeTurn {
     pub seq: i64,
     pub role: String,
-    pub block_type: String,
     pub text: String,
 }
 
 /// One candidate row carried from retrieval through rerank to display.
 pub struct Hit {
+    pub id: String,
     pub text: String,
     pub session_id: String,
     pub workdir: String,
@@ -55,7 +55,13 @@ pub struct Hit {
     pub ts: String,
     pub block_type: String,
     pub harness: String,
-    pub neighbors: Vec<Neighbor>,
+    /// The prose turns framing the hit's exchange, attached in full: the prompt that opened it, its
+    /// final summary and the next prompt.
+    pub exchange: Vec<ExchangeTurn>,
+    /// The `--memory` the hit's drill-down repeats, as the call named it; empty for a call naming
+    /// none.
+    pub memory: String,
+    pub fused: f32,
 }
 
 /// Matching blocks `scan` lists before it stops. What the cap dropped is always reported.
@@ -109,6 +115,8 @@ pub struct Session {
     pub session_id: String,
     /// First timestamp in the session.
     pub ts: String,
+    /// Timestamp of the last indexed turn, the one with the highest seq.
+    pub last_ts: String,
     pub workdir: String,
     pub harness: String,
     /// The session's source repo(s) as `owner/name`, space-joined; empty when unresolvable.
@@ -122,11 +130,6 @@ pub struct Session {
 }
 
 impl Session {
-    /// The `YYYY-MM-DD` the session started.
-    pub fn date(&self) -> &str {
-        self.ts.get(..10).unwrap_or(&self.ts)
-    }
-
     /// Best available provenance: the repo when the checkout resolved, else the working directory.
     pub fn origin(&self) -> &str {
         self.repo.split_whitespace().next().unwrap_or(&self.workdir)
@@ -149,54 +152,104 @@ pub struct Turn {
     pub blocks: Vec<String>,
 }
 
-fn scol<'a>(b: &'a RecordBatch, name: &str) -> Option<&'a StringArray> {
-    b.column_by_name(name)?.as_any().downcast_ref::<StringArray>()
+/// The day `ts` falls on: a `ts` is RFC 3339 in UTC, so its first ten characters.
+fn day(ts: &str) -> &str {
+    ts.get(..10).unwrap_or(ts)
 }
 
-fn icol<'a>(b: &'a RecordBatch, name: &str) -> Option<&'a Int64Array> {
-    b.column_by_name(name)?.as_any().downcast_ref::<Int64Array>()
+/// A bound as the `YYYY-MM-DD` it names, in that exact spelling: a bound is also compared as
+/// text, which `2026-9-18` would not survive.
+fn parse_day(s: &str) -> Result<NaiveDate> {
+    NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .ok()
+        .filter(|d| d.to_string() == s)
+        .ok_or_else(|| anyhow!("{s:?} is not a date: expected YYYY-MM-DD"))
 }
 
-fn sval(a: Option<&StringArray>, i: usize) -> String {
-    a.map(|c| c.value(i).to_string()).unwrap_or_default()
+/// The days from `since` through `until`, each an optional `YYYY-MM-DD`, both inclusive.
+#[derive(Default)]
+struct DayRange<'a> {
+    since: Option<&'a str>,
+    until: Option<&'a str>,
 }
 
-fn ival(a: Option<&Int64Array>, i: usize) -> i64 {
-    a.map(|c| c.value(i)).unwrap_or(0)
-}
-
-/// Escape a value for inlining into a Lance SQL filter string.
-fn esc(s: &str) -> String {
-    s.replace('\'', "''")
-}
-
-/// `block_type = '…' AND harness = '…'` over whichever filters are set, else None.
-fn build_where(block_type: Option<&str>, harness: Option<&str>) -> Option<String> {
-    let mut clauses = Vec::new();
-    if let Some(bt) = block_type {
-        clauses.push(format!("block_type = '{}'", esc(bt)));
+impl DayRange<'_> {
+    /// Whether the day `ts` falls on is in the range.
+    fn holds(&self, ts: &str) -> bool {
+        let d = day(ts);
+        self.since.is_none_or(|s| d >= s) && self.until.is_none_or(|u| d <= u)
     }
-    if let Some(h) = harness {
-        clauses.push(format!("harness = '{}'", esc(h)));
-    }
-    if clauses.is_empty() {
-        None
-    } else {
-        Some(clauses.join(" AND "))
-    }
-}
 
-/// 0.5^(age/half_life): 1.0 for fresh, decaying with age. half_life <= 0 disables.
-fn recency_weight(ts: &str, now: DateTime<Utc>, half_life: f64) -> f64 {
-    if half_life <= 0.0 {
-        return 1.0;
-    }
-    match DateTime::parse_from_rfc3339(ts) {
-        Ok(t) => {
-            let age_days = (now - t.with_timezone(&Utc)).num_seconds() as f64 / 86_400.0;
-            0.5f64.powf(age_days.max(0.0) / half_life)
+    /// The error a bound that is not a date deserves, else nothing.
+    fn check(&self) -> Result<()> {
+        for bound in [self.since, self.until].into_iter().flatten() {
+            parse_day(bound)?;
         }
-        Err(_) => 1.0,
+        Ok(())
+    }
+
+    /// The same test as Lance filter clauses on `ts`: `ts >= since` and `ts < the day after until`.
+    /// A filter cannot take a substring of `ts`, so here the bounds must parse.
+    fn clauses(&self) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        if let Some(since) = self.since {
+            out.push(format!("ts >= '{}'", parse_day(since)?));
+        }
+        if let Some(until) = self.until {
+            let next = parse_day(until)?.succ_opt().context("the day after is out of range")?;
+            out.push(format!("ts < '{next}'"));
+        }
+        Ok(out)
+    }
+}
+
+/// A repo as the one `owner/name` identity it names. A row's `repo` holds nothing else, so any
+/// other value would match no turn, and read as a repo that has none.
+fn parse_repo(s: &str) -> Result<&str> {
+    match s.split_once('/') {
+        Some((owner, name))
+            if !owner.is_empty() && !name.is_empty() && !name.contains('/') && !s.contains(char::is_whitespace) =>
+        {
+            Ok(s)
+        }
+        _ => Err(anyhow!("{s:?} is not a repo: expected owner/name")),
+    }
+}
+
+/// `block_type = '…' AND role = '…' AND harness IN ('…') AND <repo is one of the row's> AND
+/// ts >= '…'` over the block type and whichever other filters are set.
+fn build_where(
+    block_type: &str,
+    role: Option<&str>,
+    harness: &[String],
+    repo: Option<&str>,
+    days: &DayRange,
+) -> Result<String> {
+    let mut clauses = vec![dataset::eq("block_type", block_type)];
+    if let Some(r) = role {
+        clauses.push(dataset::eq("role", r));
+    }
+    match harness {
+        [] => {}
+        [h] => clauses.push(dataset::eq("harness", h)),
+        many => clauses.push(dataset::in_list("harness", many.iter().map(String::as_str))),
+    }
+    // A row's `repo` names every remote of its checkout, so a fork's turns match its upstream too.
+    // A checkout that did not resolve stored no repo, so its turns match none.
+    if let Some(r) = repo {
+        clauses.push(dataset::has_word("repo", parse_repo(r)?));
+    }
+    clauses.extend(days.clauses()?);
+    Ok(clauses.join(" AND "))
+}
+
+/// The stored `harness` facets a `--harness` value names. `claude` and `claude_code` name each
+/// other: Claude's turns were stored under the second before its integration wrote the first, and
+/// a memory may hold both. Any other value matches as given.
+fn harness_spellings(h: String) -> Vec<String> {
+    match h.as_str() {
+        "claude" | "claude_code" => vec!["claude_code".to_string(), "claude".to_string()],
+        _ => vec![h],
     }
 }
 
@@ -248,10 +301,7 @@ pub async fn check_readable(memory: &Memory) -> Result<()> {
     match open_for_read(memory).await? {
         ReadOutcome::Ready(_) => Ok(()),
         ReadOutcome::NoIndex => Err(no_index_error()),
-        ReadOutcome::Offline => Err(anyhow!(
-            "{} is unreachable right now — try again once you're back online",
-            memory.label()
-        )),
+        ReadOutcome::Offline => Err(memory.offline_error()),
     }
 }
 
@@ -302,160 +352,592 @@ pub fn memory_hint(read: Option<&str>) -> String {
     }
 }
 
-/// The embedder + reranker, loaded once and shared. Loading them (ONNX init) is the costly part of
-/// a recall, so a long-lived process — the MCP server — pays it on the first call and reuses them
-/// after. The `Mutex` serializes recalls (both models run with `&mut`), which is fine: the work is
-/// CPU-bound and the server's calls are serial anyway.
+/// The embedder of each model, and the reranker once a rerank has asked for it, loaded once and
+/// shared. Loading a model is the costly part of a recall, so a long-lived process (the MCP server)
+/// pays it on the first call and reuses the models after, and a search that never reranks never
+/// loads the reranker. The `Mutex` serializes recalls (the models run with `&mut`), which is fine:
+/// the work is CPU-bound and the server's calls are serial anyway.
+#[derive(Default)]
 struct Models {
-    embedder: Box<dyn Embedder>,
-    reranker: Box<dyn Reranker>,
+    embedders: HashMap<EmbeddingModel, Box<dyn Embedder>>,
+    reranker: Option<Box<dyn Reranker>>,
+}
+
+impl Models {
+    fn embedder(&mut self, model: EmbeddingModel) -> Result<&mut dyn Embedder> {
+        let embedder = match self.embedders.entry(model) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(inference::embedder(model)?),
+        };
+        Ok(embedder.as_mut())
+    }
+
+    /// The reranker, built on its first use.
+    fn reranker(&mut self) -> Result<&mut dyn Reranker> {
+        if self.reranker.is_none() {
+            self.reranker = Some(inference::reranker()?);
+        }
+        Ok(self.reranker.as_deref_mut().expect("built above"))
+    }
 }
 
 static MODELS: OnceCell<Mutex<Models>> = OnceCell::const_new();
 
 /// The shared model cache, built on first use.
-async fn models() -> Result<&'static Mutex<Models>> {
-    MODELS
-        .get_or_try_init(|| async {
-            let embedder = inference::embedder()?;
-            let reranker = inference::reranker()?;
-            Ok::<_, anyhow::Error>(Mutex::new(Models { embedder, reranker }))
-        })
-        .await
+async fn models() -> &'static Mutex<Models> {
+    MODELS.get_or_init(|| async { Mutex::new(Models::default()) }).await
 }
 
 /// A recall's defaults, owned here so the CLI and the MCP server search the same way.
 pub const DEFAULT_K: usize = 8;
 pub const DEFAULT_CANDIDATES: usize = 30;
-pub const DEFAULT_HALF_LIFE: f64 = 30.0;
-pub const DEFAULT_NEIGHBORS: i64 = 1;
 
-/// Run the recall pipeline over one memory and return the results rendered in the agent format.
-#[allow(clippy::too_many_arguments)]
-pub async fn recall(
-    memory: Memory,
-    query: String,
-    k: usize,
-    candidates: usize,
-    half_life: f64,
-    neighbors: i64,
-    block_type: Option<String>,
-    harness: Option<String>,
-) -> Result<String> {
-    let (note, memory_label, hits) = recall_hits(
-        memory,
-        query,
-        k,
-        candidates,
-        half_life,
-        neighbors,
-        block_type,
-        harness,
-        &|_| (),
-    )
-    .await?;
-    if hits.is_empty() {
-        return Ok(format!("{note}no results"));
-    }
-    Ok(crate::ui::render::recall_agent(
-        &note,
-        &memory_hint(memory_label.as_deref()),
-        &hits,
-    ))
+/// Whether a recall of `k` hits from a pool of `pool` rows reranks it: whenever the pool holds more
+/// than the hits, so the cut has something to choose. On the labeled sets, reranking the default
+/// pool finds a third more answers in the same 8 hits and puts the answer first twice as often, and
+/// the gain holds from the smallest pools: 10 rows for 8 hits find 12 more answers on funes-memory
+/// and lose none (funes-recall-benchmark, 2026-10-28). So the line sits right above `k`, at an extra
+/// latency of typically seconds, growing with the pool. A pool of `k` rows or fewer is read whole,
+/// in the fused order, and loads no reranker.
+pub fn reranks(k: usize, pool: usize) -> bool {
+    pool > k
 }
 
-/// Run the recall pipeline over one memory: hybrid retrieval → rerank → recency reweight →
-/// neighbor expansion. Returns the degradation note (empty when the memory opened normally), the
-/// label of the memory actually read, and the scored hits, best
-/// first — rendering is the caller's choice. `progress` hears a short label as each slow phase
-/// starts (model load, search, rerank); pass a no-op to run silently.
-#[allow(clippy::too_many_arguments)]
-pub async fn recall_hits(
-    memory: Memory,
+/// Run the recall pipeline over what `target` reads and return the results rendered in the agent
+/// format: each hit's passage, or one row per hit with `oneline`.
+pub async fn recall(
+    target: impl Into<Target>,
     query: String,
     k: usize,
     candidates: usize,
-    half_life: f64,
-    neighbors: i64,
-    block_type: Option<String>,
-    harness: Option<String>,
+    filter: RecallFilter,
+    oneline: bool,
+) -> Result<String> {
+    recall_with_progress(target, query, k, candidates, filter, oneline, &|_| ()).await
+}
+
+/// [`recall`], reporting each stage to `progress`.
+pub async fn recall_with_progress(
+    target: impl Into<Target>,
+    query: String,
+    k: usize,
+    candidates: usize,
+    filter: RecallFilter,
+    oneline: bool,
     progress: &(dyn Fn(&str) + Sync),
-) -> Result<(String, Option<String>, Vec<(Hit, f64)>)> {
-    // `--harness` accepts the same spellings as `index`/`add` (claude|codex|pi); normalize to the
-    // stored facet (Claude's is `claude_code`) so `--harness claude` filters instead of silently
-    // matching nothing, and an unknown value errors here rather than returning zero hits.
-    let harness = harness
-        .map(|h| Harness::parse(&h))
-        .transpose()?
-        .map(|h| h.as_str().to_string());
-
-    progress("loading model…");
-    let mut guard = models().await?.lock().await;
-    let Models { embedder, reranker } = &mut *guard;
-
-    let qv: Vec<f32> = embedder
-        .embed(&[query.as_str()])?
-        .into_iter()
-        .next()
-        .context("empty embedding")?;
-
-    progress(&format!("searching {}…", memory.label()));
-    let read = open_read(&memory).await?;
-    let note = read.note.clone().unwrap_or_default();
-    let ds = &read.ds;
-    // A `--harness` filter needs the column; on an un-migrated memory it would fail deep inside Lance
-    // with an opaque schema error, so refuse with a clear message instead.
-    if harness.is_some() && !has_harness_col(ds) {
-        return Err(anyhow!(
-            "this memory predates the harness facet — reindex it, or drop --harness"
-        ));
+) -> Result<String> {
+    let target = target.into();
+    let search = Search::new(query, candidates, filter)?;
+    let pools = target.candidates(&search, progress).await?;
+    let languages = rephrase_languages(pools.iter().map(|pool| &pool.ds));
+    let mut ranked = search.rank(pools, k, progress).await?;
+    // A one-line listing shows no frame, so it reads none.
+    if !oneline {
+        ranked.frame(&target, progress).await?;
     }
-    let where_clause = build_where(block_type.as_deref(), harness.as_deref());
+    let Ranked { note, hits, .. } = ranked;
+    Ok(if oneline {
+        crate::ui::render::recall_oneline_reply(&note, &hits, languages.as_deref())
+    } else {
+        crate::ui::render::recall_reply(&note, &hits, languages.as_deref())
+    })
+}
 
-    // Hybrid retrieval: a vector ANN scan and a BM25 scan, fused by reciprocal rank. The FTS index
-    // can be absent (it's best-effort at index time), so the FTS leg is skipped when it errors —
-    // recall then falls back to vector-only.
-    let hits = hybrid_candidates(ds, &qv, &query, candidates, where_clause.as_deref()).await?;
-    if hits.is_empty() {
-        return Ok((note, read.memory_label.clone(), Vec::new()));
+/// The hits of a recall before their exchange frame, for tooling that studies the pool rather than
+/// the reply. `progress` hears a short label as each slow phase starts.
+pub async fn ranked_hits(
+    target: impl Into<Target>,
+    query: String,
+    k: usize,
+    candidates: usize,
+    filter: RecallFilter,
+    progress: &(dyn Fn(&str) + Sync),
+) -> Result<Ranked> {
+    rank_target(&target.into(), query, k, candidates, filter, progress).await
+}
+
+/// [`ranked_hits`] over a resolved target.
+async fn rank_target(
+    target: &Target,
+    query: String,
+    k: usize,
+    candidates: usize,
+    filter: RecallFilter,
+    progress: &(dyn Fn(&str) + Sync),
+) -> Result<Ranked> {
+    let search = Search::new(query, candidates, filter)?;
+    let pools = target.candidates(&search, progress).await?;
+    search.rank(pools, k, progress).await
+}
+
+/// The hits of a recall over what `target` reads, each framed by its exchange: the degradation note
+/// (empty when the memory opened normally) and the scored hits, best first.
+pub async fn recall_hits(
+    target: impl Into<Target>,
+    query: String,
+    k: usize,
+    candidates: usize,
+    filter: RecallFilter,
+    progress: &(dyn Fn(&str) + Sync),
+) -> Result<(String, Vec<(Hit, f64)>)> {
+    let target = target.into();
+    let mut ranked = rank_target(&target, query, k, candidates, filter, progress).await?;
+    ranked.frame(&target, progress).await?;
+    Ok((ranked.note, ranked.hits))
+}
+
+/// What narrows a search.
+#[derive(Default)]
+pub struct RecallFilter {
+    /// Keep chunks of this block type: `text`, `thinking`, `tool_use` or `tool_result`.
+    pub block_type: Option<String>,
+    /// Keep turns of this role, as the turns carry it.
+    pub role: Option<String>,
+    /// Keep turns of this harness, as the turns carry it (`claude` also names `claude_code`).
+    pub harness: Option<String>,
+    /// Keep turns whose stored repo names this `owner/name`.
+    pub repo: Option<String>,
+    /// Keep turns on or after this `YYYY-MM-DD`.
+    pub since: Option<String>,
+    /// Keep turns on or before this `YYYY-MM-DD`.
+    pub until: Option<String>,
+}
+
+impl RecallFilter {
+    fn days(&self) -> DayRange<'_> {
+        DayRange {
+            since: self.since.as_deref(),
+            until: self.until.as_deref(),
+        }
+    }
+}
+
+/// One query, embedded once, and the filters every memory's search applies. A recall is
+/// [`Search::candidates`] from one or more memories, pooled into a single [`Search::rank`].
+pub struct Search {
+    query: String,
+    qv: OnceCell<(EmbeddingModel, Vec<f32>)>,
+    candidates: usize,
+    /// The columns `where_clauses` read that a migration added, which an older memory lacks.
+    migrated: Vec<&'static str>,
+    /// The filter of each search a memory runs: one per block type, or the one the filter names.
+    where_clauses: Vec<String>,
+}
+
+/// One memory's candidates for a [`Search`], before the rerank.
+pub struct Candidates {
+    ds: Dataset,
+    note: String,
+    hits: Vec<Hit>,
+}
+
+impl Candidates {
+    /// Whether the pool came from the local memory in place of an unreachable remote.
+    pub(crate) fn degraded(&self) -> bool {
+        !self.note.is_empty()
     }
 
-    let docs: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
-    progress(&format!("reranking {} candidates…", docs.len()));
-    let scores = reranker.rerank(query.as_str(), &docs)?;
-
-    let now = Utc::now();
-    let mut scored: Vec<(usize, f64)> = scores
-        .iter()
-        .enumerate()
-        .map(|(i, &s)| {
-            let relevance = 1.0 / (1.0 + (-(s as f64)).exp());
-            (i, relevance * recency_weight(&hits[i].ts, now, half_life))
-        })
-        .collect();
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(k);
-
-    // Keep only the top-k hits, in scored order, carrying their score along.
-    let mut top: Vec<(Hit, f64)> = Vec::with_capacity(scored.len());
-    let mut taken: Vec<Option<Hit>> = hits.into_iter().map(Some).collect();
-    for (idx, score) in &scored {
-        if let Some(h) = taken[*idx].take() {
-            top.push((h, *score));
+    /// Give every hit the `--memory` its drill-down repeats.
+    pub(crate) fn hint(&mut self, memory: &str) {
+        for h in &mut self.hits {
+            h.memory = memory.to_string();
         }
     }
 
-    if neighbors > 0 {
-        progress("expanding neighbors…");
-        let mut refs: Vec<&mut Hit> = top.iter_mut().map(|(h, _)| h).collect();
-        attach_neighbors(ds, &mut refs, neighbors).await?;
+    /// Keep only the candidates `keep` accepts.
+    pub fn retain(&mut self, keep: impl Fn(&Hit) -> bool) {
+        self.hits.retain(keep);
     }
-
-    Ok((note, read.memory_label.clone(), top))
 }
 
-/// Vector ANN + BM25 candidates fused by reciprocal rank, top `candidates`. The FTS leg is
-/// best-effort: a memory with no FTS index makes that scan error, and we fall back to vector-only.
+impl Search {
+    /// Search for `query`, up to `candidates` rows per memory that `filter` keeps.
+    pub fn new(query: String, candidates: usize, filter: RecallFilter) -> Result<Self> {
+        let harness = filter.harness.clone().map(harness_spellings).unwrap_or_default();
+        let mut migrated = Vec::new();
+        if filter.harness.is_some() {
+            migrated.push("harness");
+        }
+        if filter.repo.is_some() {
+            migrated.push("repo");
+        }
+        let block_types = match filter.block_type.as_deref() {
+            Some(bt) => vec![bt],
+            None => traces::BLOCK_TYPES.to_vec(),
+        };
+        let where_clauses = block_types
+            .into_iter()
+            .map(|bt| {
+                build_where(
+                    bt,
+                    filter.role.as_deref(),
+                    &harness,
+                    filter.repo.as_deref(),
+                    &filter.days(),
+                )
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            where_clauses,
+            migrated,
+            query,
+            qv: OnceCell::new(),
+            candidates,
+        })
+    }
+
+    /// Hybrid retrieval over one memory, `candidates` rows deep for each block type the search
+    /// covers: a vector ANN scan and a BM25 scan, fused by reciprocal rank.
+    pub async fn candidates(&self, memory: &Memory, progress: &(dyn Fn(&str) + Sync)) -> Result<Candidates> {
+        progress(&format!("searching {}…", memory.label()));
+        let read = open_read(memory).await?;
+        // A filter on a migrated column needs the column. On an un-migrated memory it would fail
+        // deep inside Lance with an opaque schema error, so refuse with a clear message instead.
+        if let Some(column) = self.migrated.iter().find(|c| !dataset::has_column(&read.ds, c)) {
+            bail!("this memory predates the {column} facet — reindex it, or drop --{column}");
+        }
+        let model = dataset::embedding_model(&read.ds)?;
+        let (embedded_by, qv) = self
+            .qv
+            .get_or_try_init(|| async {
+                progress("loading model…");
+                let qv = models().await.lock().await.embedder(model)?.embed_query(&self.query)?;
+                Ok::<_, anyhow::Error>((model, qv))
+            })
+            .await?;
+        if *embedded_by != model {
+            bail!(
+                "{} is embedded with {}, and the other memory of this search with {}",
+                memory.label(),
+                model.id(),
+                embedded_by.id()
+            );
+        }
+        progress(&format!("searching {}…", memory.label()));
+        let mut hits = Vec::new();
+        for clause in &self.where_clauses {
+            hits.extend(hybrid_candidates(&read.ds, qv, &self.query, self.candidates, Some(clause)).await?);
+        }
+        Ok(Candidates {
+            ds: read.ds,
+            note: read.note.unwrap_or_default(),
+            hits,
+        })
+    }
+
+    /// Rank the pooled candidates, a row several memories hold counted once: the best `candidates`
+    /// by fused score, an equal share for each block type ([`share_by_type`]), reranked by the
+    /// cross-encoder when the pool holds more rows than `k` ([`reranks`]), cut to `k`. Returns the
+    /// pools' degradation notes and the hits, best first.
+    pub async fn rank(&self, pools: Vec<Candidates>, k: usize, progress: &(dyn Fn(&str) + Sync)) -> Result<Ranked> {
+        let note: String = pools.iter().map(|p| p.note.as_str()).collect();
+        let mut seen = HashSet::new();
+        let mut hits: Vec<(usize, Hit)> = Vec::new();
+        let mut sources = Vec::with_capacity(pools.len());
+        for (i, pool) in pools.into_iter().enumerate() {
+            hits.extend(
+                pool.hits
+                    .into_iter()
+                    .filter(|h| seen.insert(h.id.clone()))
+                    .map(|h| (i, h)),
+            );
+            sources.push(pool.ds);
+        }
+        // Stable, so equal scores keep their memory's order and the earlier pool's rows.
+        hits.sort_by(|(_, a), (_, b)| b.fused.partial_cmp(&a.fused).unwrap_or(std::cmp::Ordering::Equal));
+        let hits = share_by_type(hits, self.candidates);
+        if hits.is_empty() {
+            return Ok(Ranked {
+                note,
+                hits: Vec::new(),
+                origins: Vec::new(),
+                sources,
+            });
+        }
+
+        let mut scored: Vec<(usize, f64)> = if reranks(k, hits.len()) {
+            let docs: Vec<&str> = hits.iter().map(|(_, h)| h.text.as_str()).collect();
+            progress(&format!("reranking {} candidates…", docs.len()));
+            let scores = models()
+                .await
+                .lock()
+                .await
+                .reranker()?
+                .rerank(self.query.as_str(), &docs)?;
+            scores
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| (i, 1.0 / (1.0 + (-(s as f64)).exp())))
+                .collect()
+        } else {
+            hits.iter().enumerate().map(|(i, (_, h))| (i, h.fused as f64)).collect()
+        };
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+
+        // Keep only the top-k hits, in scored order, each with its score and the memory it came from.
+        let mut taken: Vec<Option<(usize, Hit)>> = hits.into_iter().map(Some).collect();
+        let top: Vec<(usize, Hit, f64)> = scored
+            .iter()
+            .filter_map(|(idx, score)| taken[*idx].take().map(|(source, h)| (source, h, *score)))
+            .collect();
+
+        let (origins, hits) = top.into_iter().map(|(source, h, score)| (source, (h, score))).unzip();
+        Ok(Ranked {
+            note,
+            hits,
+            origins,
+            sources,
+        })
+    }
+}
+
+/// The first `limit` of `hits`, best first, in equal shares per block type: every type's best row,
+/// then every type's second, and so on. Rows of one rank keep their order. A type that runs out
+/// leaves its share to the others.
+fn share_by_type(hits: Vec<(usize, Hit)>, limit: usize) -> Vec<(usize, Hit)> {
+    let mut depth: HashMap<String, usize> = HashMap::new();
+    let mut ranked: Vec<(usize, (usize, Hit))> = hits
+        .into_iter()
+        .map(|hit| {
+            let rank = depth.entry(hit.1.block_type.clone()).or_default();
+            *rank += 1;
+            (*rank, hit)
+        })
+        .collect();
+    ranked.sort_by_key(|(rank, _)| *rank);
+    ranked.into_iter().take(limit).map(|(_, hit)| hit).collect()
+}
+
+/// A search's hits after the cut, best first, before their exchange frame ([`Ranked::frame`]).
+pub struct Ranked {
+    /// The pools' degradation notes, empty when every memory opened normally.
+    pub note: String,
+    /// The hits, best first, each with its score.
+    pub hits: Vec<(Hit, f64)>,
+    /// For each hit, the index in `sources` of the memory it came from.
+    origins: Vec<usize>,
+    sources: Vec<Dataset>,
+}
+
+impl Ranked {
+    /// Attach to each hit the turns framing its exchange. A session this host still owes the bound
+    /// memory rows of is read from the local memory, which holds it whole, as `get` reads it.
+    pub async fn frame(&mut self, target: &Target, progress: &(dyn Fn(&str) + Sync)) -> Result<()> {
+        progress("attaching exchanges…");
+        let mut attached: HashSet<(String, i64)> =
+            self.hits.iter().map(|(h, _)| (h.session_id.clone(), h.seq)).collect();
+        let sessions: BTreeSet<String> = self.hits.iter().map(|(h, _)| h.session_id.clone()).collect();
+        let mut owed = HashSet::new();
+        for sid in sessions {
+            if target.owes_session(&sid).await? {
+                owed.insert(sid);
+            }
+        }
+        if !owed.is_empty() {
+            let local = Memory::local().open().await?;
+            let mut refs: Vec<&mut Hit> = self
+                .hits
+                .iter_mut()
+                .map(|(h, _)| h)
+                .filter(|h| owed.contains(&h.session_id))
+                .collect();
+            attach_exchange(&local, &mut refs, &mut attached).await?;
+        }
+        for (i, ds) in self.sources.iter().enumerate() {
+            let mut refs: Vec<&mut Hit> = self
+                .hits
+                .iter_mut()
+                .zip(&self.origins)
+                .filter(|((h, _), origin)| **origin == i && !owed.contains(&h.session_id))
+                .map(|((h, _), _)| h)
+                .collect();
+            attach_exchange(ds, &mut refs, &mut attached).await?;
+        }
+        Ok(())
+    }
+}
+
+/// An attached turn under assembly, keyed by (session, seq): its role, and its text blocks' splits,
+/// each keyed by (block_idx, split_idx) with its chunk id and text.
+type ExchangeTexts = HashMap<(String, i64), (String, Vec<((i64, i64), String, String)>)>;
+
+/// Attach to each hit the prose turns framing its exchange, once per reply: `taken` arrives holding
+/// the hits' own turns, which the reply shows already.
+async fn attach_exchange(ds: &Dataset, hits: &mut [&mut Hit], taken: &mut HashSet<(String, i64)>) -> Result<()> {
+    if hits.is_empty() {
+        return Ok(());
+    }
+    // Placing the turns needs no text, so the text is read for the few turns chosen alone.
+    let sessions: BTreeSet<&str> = hits.iter().map(|h| h.session_id.as_str()).collect();
+    let in_sessions = sessions
+        .iter()
+        .map(|s| dataset::eq("session_id", s))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let cols = ["session_id", "seq", "role", "block_type"];
+    let batches = dataset::scan_rows(ds, &cols, Some(in_sessions.as_str()), None).await?;
+    // (session, seq) -> (role, has a text block, has a tool_result block)
+    let mut turns: HashMap<(String, i64), (String, bool, bool)> = HashMap::new();
+    for batch in &batches {
+        let (sess, role, bt) = (
+            dataset::strs(batch, "session_id"),
+            dataset::strs(batch, "role"),
+            dataset::strs(batch, "block_type"),
+        );
+        let seq = dataset::ints(batch, "seq");
+        for i in 0..batch.num_rows() {
+            let e = turns
+                .entry((sess.get(i).to_string(), seq.get(i)))
+                .or_insert_with(|| (role.get(i).to_string(), false, false));
+            match bt.get(i) {
+                "text" => e.1 = true,
+                "tool_result" => e.2 = true,
+                _ => {}
+            }
+        }
+    }
+    // The start of every user text block says whether it is the human's words or scaffolding.
+    let pred = format!(
+        "({in_sessions}) AND {} AND {} AND split_idx = 0",
+        dataset::eq("role", "user"),
+        dataset::eq("block_type", "text")
+    );
+    let cols = ["session_id", "seq", "block_idx", "text"];
+    let batches = dataset::scan_rows(ds, &cols, Some(pred.as_str()), None).await?;
+    let mut scaffolding: HashSet<(String, i64, i64)> = HashSet::new();
+    let mut spoken: HashSet<(String, i64)> = HashSet::new();
+    for batch in &batches {
+        let (sess, text) = (dataset::strs(batch, "session_id"), dataset::strs(batch, "text"));
+        let (seq, bi) = (dataset::ints(batch, "seq"), dataset::ints(batch, "block_idx"));
+        for i in 0..batch.num_rows() {
+            if traces::is_scaffolding(text.get(i)) {
+                scaffolding.insert((sess.get(i).to_string(), seq.get(i), bi.get(i)));
+            } else {
+                spoken.insert((sess.get(i).to_string(), seq.get(i)));
+            }
+        }
+    }
+    let mut prompts: HashMap<&str, Vec<i64>> = HashMap::new();
+    let mut summaries: HashMap<&str, Vec<i64>> = HashMap::new();
+    for ((sid, seq), (role, text, tool_result)) in &turns {
+        if role == "user" && !*tool_result && spoken.contains(&(sid.clone(), *seq)) {
+            prompts.entry(sid.as_str()).or_default().push(*seq);
+        }
+        if role == "assistant" && *text {
+            summaries.entry(sid.as_str()).or_default().push(*seq);
+        }
+    }
+    for v in prompts.values_mut() {
+        v.sort_unstable();
+    }
+    for v in summaries.values_mut() {
+        v.sort_unstable();
+    }
+    let mut wanted: Vec<Vec<(String, i64)>> = Vec::with_capacity(hits.len());
+    let mut completed = HashSet::new();
+    for h in hits.iter() {
+        let ps = prompts.get(h.session_id.as_str()).map_or(&[][..], Vec::as_slice);
+        let ss = summaries.get(h.session_id.as_str()).map_or(&[][..], Vec::as_slice);
+        let p = ps.iter().rev().find(|&&s| s <= h.seq).copied();
+        let n = ps.iter().find(|&&s| s > h.seq).copied();
+        let (lo, hi) = (p.unwrap_or(i64::MIN), n.unwrap_or(i64::MAX));
+        let s = ss.iter().rev().find(|&&s| s >= lo && s < hi).copied();
+        let mut want: Vec<i64> = [p, s, n].into_iter().flatten().collect();
+        want.sort_unstable();
+        want.dedup();
+        let keep = want
+            .into_iter()
+            .filter(|&seq| {
+                let key = (h.session_id.clone(), seq);
+                if seq == h.seq {
+                    completed.insert(key)
+                } else {
+                    taken.insert(key)
+                }
+            })
+            .map(|seq| (h.session_id.clone(), seq))
+            .collect();
+        wanted.push(keep);
+    }
+    let all: Vec<&(String, i64)> = wanted.iter().flatten().collect();
+    if all.is_empty() {
+        return Ok(());
+    }
+    let pred = all
+        .iter()
+        .map(|(sid, seq)| format!("({} AND seq = {seq})", dataset::eq("session_id", sid)))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let cols = [
+        "id",
+        "session_id",
+        "seq",
+        "role",
+        "block_type",
+        "block_idx",
+        "split_idx",
+        "text",
+    ];
+    let batches = dataset::scan_rows(ds, &cols, Some(pred.as_str()), None).await?;
+    let mut texts: ExchangeTexts = HashMap::new();
+    for batch in &batches {
+        let (id, sess, role, bt, text) = (
+            dataset::strs(batch, "id"),
+            dataset::strs(batch, "session_id"),
+            dataset::strs(batch, "role"),
+            dataset::strs(batch, "block_type"),
+            dataset::strs(batch, "text"),
+        );
+        let (seq, bi, si) = (
+            dataset::ints(batch, "seq"),
+            dataset::ints(batch, "block_idx"),
+            dataset::ints(batch, "split_idx"),
+        );
+        for i in 0..batch.num_rows() {
+            if bt.get(i) != "text" {
+                continue;
+            }
+            let e = texts
+                .entry((sess.get(i).to_string(), seq.get(i)))
+                .or_insert_with(|| (role.get(i).to_string(), Vec::new()));
+            e.1.push(((bi.get(i), si.get(i)), id.get(i).to_string(), text.get(i).to_string()));
+        }
+    }
+    for (h, keys) in hits.iter_mut().zip(wanted) {
+        for key in keys {
+            let Some((role, mut splits)) = texts.remove(&key) else {
+                continue;
+            };
+            splits.sort_by_key(|(k, _, _)| *k);
+            // A block of one split that is the hit itself is already shown whole.
+            let mut blocks: Vec<(i64, usize, String, String)> = Vec::new();
+            for ((bi, _), id, piece) in splits {
+                match blocks.last_mut() {
+                    Some((last, n, _, text)) if *last == bi => {
+                        let joined = chunk::stitch(text, &piece);
+                        *text = joined;
+                        *n += 1;
+                    }
+                    _ => blocks.push((bi, 1, id, piece)),
+                }
+            }
+            let text = blocks
+                .into_iter()
+                .filter(|(_, n, id, _)| !(*n == 1 && *id == h.id))
+                .filter(|(bi, _, _, _)| !scaffolding.contains(&(key.0.clone(), key.1, *bi)))
+                .map(|(_, _, _, t)| t)
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            if !text.is_empty() {
+                h.exchange.push(ExchangeTurn { seq: key.1, role, text });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Vector ANN + BM25 candidates fused by reciprocal rank, top `candidates`.
 async fn hybrid_candidates(
     ds: &Dataset,
     qv: &[f32],
@@ -464,57 +946,23 @@ async fn hybrid_candidates(
     filter: Option<&str>,
 ) -> Result<Vec<Hit>> {
     let vector = vector_candidates(ds, qv, candidates, filter).await?;
-    let fts = fts_candidates(ds, query, candidates, filter).await.unwrap_or_default();
+    let fts = fts_candidates(ds, query, candidates, filter).await?;
     Ok(rrf_fuse(vector, fts, candidates))
 }
 
-/// Top-`limit` rows by vector distance, each with its `_rowid` (the fusion key).
+/// Top-`limit` rows by vector distance, each with its row id (the fusion key).
 async fn vector_candidates(ds: &Dataset, qv: &[f32], limit: usize, filter: Option<&str>) -> Result<Vec<(u64, Hit)>> {
-    let query = Float32Array::from(qv.to_vec());
-    let mut scan = ds.scan();
-    scan.nearest("vector", &query, limit)?;
-    if let Some(f) = filter {
-        // Prefilter: apply the filter before the ANN search, not as a post-filter on the top-`limit`
-        // nearest rows. A selective `--type`/`--harness` would otherwise drop most (or all) of a
-        // globally-nearest pool, returning far fewer than `limit` hits even when matches exist.
-        scan.prefilter(true);
-        scan.filter(f)?;
-    }
-    scan.project(&hit_cols(ds))?;
-    scan.with_row_id();
-    collect_hits(scan).await
+    hits_of(&dataset::nearest(ds, qv, limit, filter, &hit_cols(ds)).await?)
 }
 
-/// Top-`limit` rows by BM25 score, each with its `_rowid`. Errors if the memory has no FTS index.
+/// Top-`limit` rows by BM25 score, each with its row id. Errors if the memory has no FTS index.
 async fn fts_candidates(ds: &Dataset, query: &str, limit: usize, filter: Option<&str>) -> Result<Vec<(u64, Hit)>> {
-    let mut scan = ds.scan();
-    scan.full_text_search(FullTextSearchQuery::new(query.to_string()))?;
-    if let Some(f) = filter {
-        // Prefilter so the filter shapes the FTS result set before `limit`, not after.
-        scan.prefilter(true);
-        scan.filter(f)?;
-    }
-    scan.project(&hit_cols(ds))?;
-    scan.with_row_id();
-    scan.limit(Some(limit as i64), None)?;
-    collect_hits(scan).await
+    hits_of(&dataset::full_text(ds, query, limit, filter, &hit_cols(ds)).await?)
 }
 
-/// Whether the dataset carries `name`. Projecting a column a memory predates errors, so every
-/// migrated column is asked for before it is read.
-fn has_col(ds: &Dataset, name: &str) -> bool {
-    arrow_schema::Schema::from(ds.schema()).column_with_name(name).is_some()
-}
-
-/// Whether the memory carries the `harness` column — false for one built before the facet existed.
-fn has_harness_col(ds: &Dataset) -> bool {
-    has_col(ds, "harness")
-}
-
-/// `HIT_COLS`, minus `harness` on an un-migrated memory: projecting a column the dataset lacks errors,
-/// so drop it and let `collect_hits` default the field to "".
+/// `HIT_COLS`, minus `harness` on an un-migrated memory, which [`hits_of`] then reads as "".
 fn hit_cols(ds: &Dataset) -> Vec<&'static str> {
-    let has_harness = has_harness_col(ds);
+    let has_harness = dataset::has_column(ds, "harness");
     HIT_COLS
         .iter()
         .copied()
@@ -522,47 +970,55 @@ fn hit_cols(ds: &Dataset) -> Vec<&'static str> {
         .collect()
 }
 
-/// Drain a scan into `(rowid, Hit)` rows, preserving the scan's order (its rank).
-async fn collect_hits(scan: lance::dataset::scanner::Scanner) -> Result<Vec<(u64, Hit)>> {
-    let mut stream = scan.try_into_stream().await?;
+/// The `(row id, Hit)` of every row of `batches`, in their order (the search's rank), equal scores
+/// by row id.
+fn hits_of(batches: &[RecordBatch]) -> Result<Vec<(u64, Hit)>> {
     let mut out = Vec::new();
-    while let Some(batch) = stream.try_next().await? {
-        let rowid = batch
-            .column_by_name(ROW_ID)
-            .and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
-        let (text, sess, proj, turn, ts, bt) = (
-            scol(&batch, "text"),
-            scol(&batch, "session_id"),
-            scol(&batch, "workdir"),
-            scol(&batch, "turn_uuid"),
-            scol(&batch, "ts"),
-            scol(&batch, "block_type"),
+    for batch in batches {
+        let row_ids = dataset::row_ids(batch)?;
+        let scores = dataset::search_scores(batch)?;
+        let (chunk_id, text, sess, proj, turn, ts, bt, harness) = (
+            dataset::strs(batch, "id"),
+            dataset::strs(batch, "text"),
+            dataset::strs(batch, "session_id"),
+            dataset::strs(batch, "workdir"),
+            dataset::strs(batch, "turn_uuid"),
+            dataset::strs(batch, "ts"),
+            dataset::strs(batch, "block_type"),
+            dataset::strs(batch, "harness"),
         );
-        let seq = icol(&batch, "seq");
-        let harness = scol(&batch, "harness");
-        for i in 0..batch.num_rows() {
-            let id = rowid.map(|c| c.value(i)).unwrap_or(0);
+        let seq = dataset::ints(batch, "seq");
+        for (i, &score) in scores.iter().enumerate() {
             out.push((
-                id,
+                score,
+                row_ids.get(i),
                 Hit {
-                    text: sval(text, i),
-                    session_id: sval(sess, i),
-                    workdir: sval(proj, i),
-                    turn_uuid: sval(turn, i),
-                    seq: ival(seq, i),
-                    ts: sval(ts, i),
-                    block_type: sval(bt, i),
-                    harness: sval(harness, i),
-                    neighbors: Vec::new(),
+                    id: chunk_id.get(i).to_string(),
+                    text: text.get(i).to_string(),
+                    session_id: sess.get(i).to_string(),
+                    workdir: proj.get(i).to_string(),
+                    turn_uuid: turn.get(i).to_string(),
+                    seq: seq.get(i),
+                    ts: ts.get(i).to_string(),
+                    block_type: bt.get(i).to_string(),
+                    harness: harness.get(i).to_string(),
+                    exchange: Vec::new(),
+                    memory: String::new(),
+                    fused: 0.0,
                 },
             ));
         }
     }
-    Ok(out)
+    // Equal BM25 scores come back in an order that depends on which of Lance's index segments
+    // finishes first.
+    for tie in out.chunk_by_mut(|(a, ..), (b, ..)| a == b) {
+        tie.sort_unstable_by_key(|(_, id, _)| *id);
+    }
+    Ok(out.into_iter().map(|(_, id, hit)| (id, hit)).collect())
 }
 
 /// Reciprocal-rank fusion (k=60): each list contributes `1/(rank + 60)` to a row's score; return
-/// the top `limit` rows by fused score, deduped by `_rowid`.
+/// the top `limit` rows by fused score, deduped by `_rowid`, each carrying its score.
 fn rrf_fuse(vector: Vec<(u64, Hit)>, fts: Vec<(u64, Hit)>, limit: usize) -> Vec<Hit> {
     const K: f32 = 60.0;
     let mut scores: HashMap<u64, f32> = HashMap::new();
@@ -574,87 +1030,17 @@ fn rrf_fuse(vector: Vec<(u64, Hit)>, fts: Vec<(u64, Hit)>, limit: usize) -> Vec<
         }
     }
     let mut ranked: Vec<(u64, f32)> = scores.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Sorted by fused score, and by row id where scores are equal, so the cut never moves.
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
     ranked.truncate(limit);
-    ranked.into_iter().filter_map(|(id, _)| rows.remove(&id)).collect()
-}
-
-/// For each hit, pull chunks in the same session within `window` of its seq (excluding the
-/// hit's own turn) as surrounding context. One combined scan covers every hit.
-async fn attach_neighbors(ds: &Dataset, hits: &mut [&mut Hit], window: i64) -> Result<()> {
-    if hits.is_empty() {
-        return Ok(());
-    }
-    let pred = hits
-        .iter()
-        .map(|h| {
-            format!(
-                "(session_id = '{}' AND seq >= {} AND seq <= {})",
-                esc(&h.session_id),
-                h.seq - window,
-                h.seq + window
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" OR ");
-
-    let cols = [
-        "session_id",
-        "turn_uuid",
-        "seq",
-        "role",
-        "block_type",
-        "text",
-        "block_idx",
-        "split_idx",
-    ];
-    let batches = dataset::scan_rows(ds, &cols, Some(pred.as_str()), None).await?;
-
-    let mut rows: Vec<NeighborRow> = Vec::new();
-    for batch in batches {
-        let (sess, turn, role, bt, text) = (
-            scol(&batch, "session_id"),
-            scol(&batch, "turn_uuid"),
-            scol(&batch, "role"),
-            scol(&batch, "block_type"),
-            scol(&batch, "text"),
-        );
-        let (seq, bi, si) = (
-            icol(&batch, "seq"),
-            icol(&batch, "block_idx"),
-            icol(&batch, "split_idx"),
-        );
-        for i in 0..batch.num_rows() {
-            rows.push((
-                sval(sess, i),
-                ival(seq, i),
-                sval(turn, i),
-                ival(bi, i),
-                ival(si, i),
-                sval(role, i),
-                sval(bt, i),
-                sval(text, i),
-            ));
-        }
-    }
-
-    for h in hits.iter_mut() {
-        let mut ns: Vec<&NeighborRow> = rows
-            .iter()
-            .filter(|r| r.0 == h.session_id && r.2 != h.turn_uuid && (r.1 - h.seq).abs() <= window)
-            .collect();
-        ns.sort_by_key(|r| (r.1, r.3, r.4));
-        h.neighbors = ns
-            .into_iter()
-            .map(|r| Neighbor {
-                seq: r.1,
-                role: r.5.clone(),
-                block_type: r.6.clone(),
-                text: r.7.clone(),
-            })
-            .collect();
-    }
-    Ok(())
+    ranked
+        .into_iter()
+        .filter_map(|(id, fused)| rows.remove(&id).map(|h| Hit { fused, ..h }))
+        .collect()
 }
 
 /// Which turns of a session to read, as a `seq` range: `seq` is the session's own dense counter over
@@ -672,7 +1058,8 @@ pub struct TurnRange {
 pub const DEFAULT_SPAN: i64 = 20;
 
 /// Read a range of a session's turns, rendered in the agent format.
-pub async fn get(memory: Memory, session_id: String, range: TurnRange) -> Result<String> {
+pub async fn get(target: impl Into<Target>, session_id: String, range: TurnRange) -> Result<String> {
+    let memory = target.into().holder(&session_id).await?;
     let label = memory.label();
     let (note, turns, total) = get_turns(memory, session_id.clone(), range).await?;
     // A session with no rows is absent, not empty: only a range can come back empty.
@@ -695,32 +1082,32 @@ pub async fn get_turns(memory: Memory, session_id: String, range: TurnRange) -> 
     let ds = &read.ds;
 
     let cols = ["turn_uuid", "seq", "ts", "role", "text", "block_idx", "split_idx"];
-    let filter = format!("session_id = '{}'", esc(&session_id));
+    let filter = dataset::eq("session_id", &session_id);
     let batches = dataset::scan_rows(ds, &cols, Some(filter.as_str()), None).await?;
 
     // `text` is already the rendered chunk as stored by the indexer — do not re-render.
     let mut rows: Vec<TurnRow> = Vec::new();
-    for batch in batches {
+    for batch in &batches {
         let (turn, ts, role, text) = (
-            scol(&batch, "turn_uuid"),
-            scol(&batch, "ts"),
-            scol(&batch, "role"),
-            scol(&batch, "text"),
+            dataset::strs(batch, "turn_uuid"),
+            dataset::strs(batch, "ts"),
+            dataset::strs(batch, "role"),
+            dataset::strs(batch, "text"),
         );
         let (seq, bi, si) = (
-            icol(&batch, "seq"),
-            icol(&batch, "block_idx"),
-            icol(&batch, "split_idx"),
+            dataset::ints(batch, "seq"),
+            dataset::ints(batch, "block_idx"),
+            dataset::ints(batch, "split_idx"),
         );
         for i in 0..batch.num_rows() {
             rows.push((
-                ival(seq, i),
-                sval(turn, i),
-                sval(ts, i),
-                sval(role, i),
-                ival(bi, i),
-                ival(si, i),
-                sval(text, i),
+                seq.get(i),
+                turn.get(i).to_string(),
+                ts.get(i).to_string(),
+                role.get(i).to_string(),
+                bi.get(i),
+                si.get(i),
+                text.get(i).to_string(),
             ));
         }
     }
@@ -761,36 +1148,81 @@ impl SessionFilter {
                 return false;
             }
         }
-        if let Some(since) = &self.since {
-            if s.date() < since.as_str() {
-                return false;
-            }
+        self.days().holds(&s.ts)
+    }
+
+    fn days(&self) -> DayRange<'_> {
+        DayRange {
+            since: self.since.as_deref(),
+            until: self.until.as_deref(),
         }
-        if let Some(until) = &self.until {
-            if s.date() > until.as_str() {
-                return false;
-            }
-        }
-        true
     }
 }
 
-/// The sessions of a memory that `filter` keeps, oldest first, rendered in the agent format. The
-/// prompts are read after the filter and the bound, so their cost follows the rows rendered rather
-/// than the size of the memory.
-pub async fn sessions(memory: Memory, filter: SessionFilter) -> Result<String> {
-    // Zero would render nothing, which is never what a caller wants.
+/// The sessions `target` reads that `filter` keeps, oldest first, rendered in the agent format.
+pub async fn sessions(target: impl Into<Target>, filter: SessionFilter) -> Result<String> {
+    check_filter(&filter)?;
+    list_sessions(target.into().session_pools().await?, filter).await
+}
+
+/// One memory's sessions, before a listing pools, filters and pages them.
+pub struct SessionPool {
+    ds: Dataset,
+    note: String,
+    label: String,
+    sessions: Vec<Session>,
+}
+
+impl SessionPool {
+    /// Keep only the sessions `keep` accepts.
+    pub fn retain(&mut self, keep: impl Fn(&Session) -> bool) {
+        self.sessions.retain(keep);
+    }
+
+    /// Open `memory` and fold its rows into sessions.
+    pub async fn open(memory: &Memory) -> Result<Self> {
+        let read = open_read(memory).await?;
+        Ok(Self {
+            sessions: scan_sessions(&read.ds).await?,
+            note: read.note.unwrap_or_default(),
+            label: read.memory_label.unwrap_or_else(|| memory.label()),
+            ds: read.ds,
+        })
+    }
+}
+
+/// Zero would render nothing, which is never what a caller wants, and a bound that is not a date
+/// would match nothing or everything without a word.
+fn check_filter(filter: &SessionFilter) -> Result<()> {
     if filter.limit == Some(0) {
         bail!("a limit of 0 would list nothing — omit it for {SESSIONS_LIMIT} rows, raise it to at most {SESSIONS_LIMIT_MAX}, and walk the rest with --offset");
     }
-    let read = open_read(&memory).await?;
-    let note = read.note.clone().unwrap_or_default();
-    let label = read.memory_label.clone().unwrap_or_else(|| memory.label());
-    let all = scan_sessions(&read.ds).await?;
+    filter.days().check()
+}
+
+/// The sessions of the pooled memories that `filter` keeps, oldest first, rendered in the agent
+/// format; a session several pools hold is listed from the first. The prompts are read after the
+/// filter and the bound, so their cost follows the rows rendered rather than the size of the memory.
+pub async fn list_sessions(mut pools: Vec<SessionPool>, filter: SessionFilter) -> Result<String> {
+    check_filter(&filter)?;
+    let note: String = pools.iter().map(|p| p.note.as_str()).collect();
+    let label = pools.first().map(|p| p.label.clone()).unwrap_or_default();
+    let mut seen = HashSet::new();
+    let mut all: Vec<(usize, Session)> = Vec::new();
+    for (i, pool) in pools.iter_mut().enumerate() {
+        let sessions = std::mem::take(&mut pool.sessions);
+        all.extend(
+            sessions
+                .into_iter()
+                .filter(|s| seen.insert(s.session_id.clone()))
+                .map(|s| (i, s)),
+        );
+    }
     if all.is_empty() {
         return Ok(format!("{note}no sessions in {label}\n"));
     }
-    let matched: Vec<Session> = all.into_iter().filter(|s| filter.keeps(s)).collect();
+    all.sort_by(|(_, a), (_, b)| (&a.ts, &a.session_id).cmp(&(&b.ts, &b.session_id)));
+    let matched: Vec<(usize, Session)> = all.into_iter().filter(|(_, s)| filter.keeps(s)).collect();
     if matched.is_empty() {
         return Ok(format!("{note}no session in {label} matches\n"));
     }
@@ -800,128 +1232,152 @@ pub async fn sessions(memory: Memory, filter: SessionFilter) -> Result<String> {
     let total = matched.len();
     let limit = filter.limit.unwrap_or(SESSIONS_LIMIT).min(SESSIONS_LIMIT_MAX);
     let end = total.saturating_sub(filter.offset);
-    let mut shown: Vec<Session> = matched.into_iter().take(end).skip(end.saturating_sub(limit)).collect();
+    let shown: Vec<(usize, Session)> = matched.into_iter().take(end).skip(end.saturating_sub(limit)).collect();
     if shown.is_empty() {
         return Ok(format!(
             "{note}offset {} is past the {total} session(s) in {label}\n",
             filter.offset
         ));
     }
-    let ids: Vec<String> = shown.iter().map(|s| s.session_id.clone()).collect();
-    let mut prompts = first_prompts(&read.ds, &ids).await?;
-    for s in shown.iter_mut() {
-        s.first_prompt = prompts.remove(&s.session_id).unwrap_or_default();
+    let mut prompts = HashMap::new();
+    for (i, pool) in pools.iter().enumerate() {
+        let ids: Vec<String> = shown
+            .iter()
+            .filter(|(from, _)| *from == i)
+            .map(|(_, s)| s.session_id.clone())
+            .collect();
+        prompts.extend(first_prompts(&pool.ds, &ids).await?);
     }
+    let shown: Vec<Session> = shown
+        .into_iter()
+        .map(|(_, s)| Session {
+            first_prompt: prompts.remove(&s.session_id).unwrap_or_default(),
+            ..s
+        })
+        .collect();
     Ok(crate::ui::render::sessions_agent(&note, &shown, total, filter.offset))
 }
 
-/// Whether a user text block's start is injected scaffolding rather than the human's words. Harness
-/// wrappers are XML-ish tags (`<ide_opened_file>`, `<command-name>`, `<environment_context>`,
-/// `<system-reminder>`, …); codex/pi agent-notes open with a markdown heading (`# AGENTS.md
-/// instructions…`); a Claude skill loads with the `Base directory for this skill:` preamble; a
-/// compacted session replays its machine-written recap as a user turn opening `This session is being
-/// continued…`. All are recognizable from the block's start (a mid-block split can begin anywhere, so
-/// test split 0).
-pub(crate) fn is_scaffolding(block_start: &str) -> bool {
-    let t = block_start.trim_start();
-    t.starts_with('<')
-        || t.starts_with('#')
-        || t.starts_with("Base directory for this skill")
-        || t.starts_with("This session is being continued from a previous conversation")
-}
-
-/// The opening real prompt of each session in `ids` — its earliest user text block that isn't
-/// injected scaffolding, collapsed to one line. A session whose user turns are all scaffolding is
-/// absent from the map.
+/// The opening real prompt of each session in `ids` — its earliest `user` text block that isn't
+/// injected scaffolding, or its earliest text block of any role when it has no `user` turn at all.
+/// A session whose `user` turns are all scaffolding is absent from the map.
 async fn first_prompts(ds: &Dataset, ids: &[String]) -> Result<HashMap<String, String>> {
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let list: Vec<String> = ids.iter().map(|id| format!("'{}'", esc(id))).collect();
     // Split 0 only: `is_scaffolding` reads a block's start, and a later split begins mid-text.
     let filter = format!(
-        "session_id IN ({}) AND role = 'user' AND block_type = 'text' AND split_idx = 0",
-        list.join(", ")
+        "{} AND block_type = 'text' AND split_idx = 0",
+        dataset::in_list("session_id", ids.iter().map(String::as_str))
     );
-    let cols = ["session_id", "seq", "block_idx", "text"];
+    let cols = ["session_id", "seq", "block_idx", "role", "text"];
     let batches = dataset::scan_rows(ds, &cols, Some(&filter), None).await?;
-    let mut best: HashMap<String, ((i64, i64), String)> = HashMap::new();
-    for batch in &batches {
-        let (sid, text) = (scol(batch, "session_id"), scol(batch, "text"));
-        let (seq, bi) = (icol(batch, "seq"), icol(batch, "block_idx"));
-        for i in 0..batch.num_rows() {
-            let body = sval(text, i);
-            if is_scaffolding(&body) {
-                continue;
-            }
-            let key = (ival(seq, i), ival(bi, i));
-            match best.entry(sval(sid, i)) {
-                std::collections::hash_map::Entry::Occupied(mut e) if key < e.get().0 => {
-                    e.insert((key, body));
-                }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert((key, body));
-                }
-                _ => {}
-            }
+    // `has_user`: a session whose `user` texts are all scaffolding opens on nothing, not on a reply.
+    #[derive(Default)]
+    struct Opening {
+        user: Option<((i64, i64), String)>,
+        has_user: bool,
+        any: Option<((i64, i64), String)>,
+    }
+    fn earliest(slot: &mut Option<((i64, i64), String)>, key: (i64, i64), body: &str) {
+        if slot.as_ref().is_none_or(|(k, _)| key < *k) {
+            *slot = Some((key, body.to_string()));
         }
     }
-    Ok(best.into_iter().map(|(id, (_, text))| (id, text)).collect())
+    let mut best: HashMap<String, Opening> = HashMap::new();
+    for batch in &batches {
+        let (sid, role, text) = (
+            dataset::strs(batch, "session_id"),
+            dataset::strs(batch, "role"),
+            dataset::strs(batch, "text"),
+        );
+        let (seq, bi) = (dataset::ints(batch, "seq"), dataset::ints(batch, "block_idx"));
+        for i in 0..batch.num_rows() {
+            let body = text.get(i).to_string();
+            let key = (seq.get(i), bi.get(i));
+            let opening = best.entry(sid.get(i).to_string()).or_default();
+            if role.get(i) == "user" {
+                opening.has_user = true;
+                if !traces::is_scaffolding(&body) {
+                    earliest(&mut opening.user, key, &body);
+                }
+            }
+            earliest(&mut opening.any, key, &body);
+        }
+    }
+    Ok(best
+        .into_iter()
+        .filter_map(|(id, o)| {
+            let pick = if o.has_user { o.user } else { o.any };
+            pick.map(|(_, text)| (id, text))
+        })
+        .collect())
 }
 
 /// Fold every row into its session: earliest timestamp, provenance, and distinct turn count. Reads
 /// metadata only — the opening prompts cost a `text` read, so they are fetched separately.
 async fn scan_sessions(ds: &Dataset) -> Result<Vec<Session>> {
     let mut cols = vec!["session_id", "ts", "workdir", "turn_uuid", "seq"];
-    if has_harness_col(ds) {
-        cols.push("harness");
-    }
-    if has_col(ds, "repo") {
-        cols.push("repo");
-    }
-    let batches = dataset::scan_rows(ds, &cols, None, None).await?;
-
-    let mut by_id: HashMap<String, (Session, HashSet<(i64, String)>)> = HashMap::new();
-    for batch in &batches {
-        let (sid, ts, wd, turn, harness, repo) = (
-            scol(batch, "session_id"),
-            scol(batch, "ts"),
-            scol(batch, "workdir"),
-            scol(batch, "turn_uuid"),
-            scol(batch, "harness"),
-            scol(batch, "repo"),
-        );
-        let seq = icol(batch, "seq");
-        for i in 0..batch.num_rows() {
-            let id = sval(sid, i);
-            let (session, turns) = by_id.entry(id.clone()).or_insert_with(|| {
-                (
-                    Session {
-                        session_id: id,
-                        ts: sval(ts, i),
-                        workdir: sval(wd, i),
-                        harness: sval(harness, i),
-                        repo: sval(repo, i),
-                        turns: 0,
-                        first_prompt: String::new(),
-                    },
-                    HashSet::new(),
-                )
-            });
-            // Rows arrive in scan order, not time order, so the first one seen isn't the earliest.
-            let row_ts = sval(ts, i);
-            if row_ts < session.ts {
-                session.ts = row_ts;
-            }
-            turns.insert((ival(seq, i), sval(turn, i)));
+    for migrated in ["harness", "repo"] {
+        if dataset::has_column(ds, migrated) {
+            cols.push(migrated);
         }
     }
+    // A session's fold: its distinct turns and the highest seq seen, which names the last one.
+    struct Fold {
+        session: Session,
+        turns: HashSet<(i64, String)>,
+        last_seq: i64,
+    }
+    let by_id: HashMap<String, Fold> = dataset::scan_fold(ds, &cols, None, None, HashMap::new(), |mut by_id, batch| {
+        let (sid, ts, wd, turn, harness, repo) = (
+            dataset::strs(&batch, "session_id"),
+            dataset::strs(&batch, "ts"),
+            dataset::strs(&batch, "workdir"),
+            dataset::strs(&batch, "turn_uuid"),
+            dataset::strs(&batch, "harness"),
+            dataset::strs(&batch, "repo"),
+        );
+        let seq = dataset::ints(&batch, "seq");
+        for i in 0..batch.num_rows() {
+            let id = sid.get(i).to_string();
+            let row_seq = seq.get(i);
+            let fold = by_id.entry(id.clone()).or_insert_with(|| Fold {
+                session: Session {
+                    session_id: id,
+                    ts: ts.get(i).to_string(),
+                    last_ts: ts.get(i).to_string(),
+                    workdir: wd.get(i).to_string(),
+                    harness: harness.get(i).to_string(),
+                    repo: repo.get(i).to_string(),
+                    turns: 0,
+                    first_prompt: String::new(),
+                },
+                turns: HashSet::new(),
+                last_seq: row_seq,
+            });
+            // Rows arrive in scan order, not time order, so the first one seen isn't the earliest.
+            let row_ts = ts.get(i).to_string();
+            if row_ts < fold.session.ts {
+                fold.session.ts = row_ts.clone();
+            }
+            // The last turn is the highest seq, whatever its stamp: a source may stamp its turns
+            // out of order.
+            if row_seq > fold.last_seq {
+                fold.last_seq = row_seq;
+                fold.session.last_ts = row_ts;
+            }
+            fold.turns.insert((row_seq, turn.get(i).to_string()));
+        }
+        by_id
+    })
+    .await?;
 
     let mut out: Vec<Session> = by_id
         .into_values()
-        .map(|(session, turns)| Session {
-            turns: turns.len(),
-            ..session
+        .map(|fold| Session {
+            turns: fold.turns.len(),
+            ..fold.session
         })
         .collect();
     out.sort_by(|a, b| (&a.ts, &a.session_id).cmp(&(&b.ts, &b.session_id)));
@@ -949,7 +1405,7 @@ type BlockParts = HashMap<(i64, String, i64), (Block, Vec<(i64, String)>)>;
 ///
 /// A session that isn't in the memory is an error, not an empty result.
 pub async fn scan(
-    memory: Memory,
+    target: impl Into<Target>,
     needle: String,
     session_id: String,
     from: Option<i64>,
@@ -957,6 +1413,9 @@ pub async fn scan(
     ignore_case: bool,
     context: usize,
 ) -> Result<String> {
+    let target = target.into();
+    let hint = target.hint();
+    let memory = target.holder(&session_id).await?;
     let read = open_read(&memory).await?;
     let note = read.note.clone().unwrap_or_default();
     let label = read.memory_label.clone().unwrap_or_else(|| memory.label());
@@ -976,12 +1435,7 @@ pub async fn scan(
         bail!("no session {session_id} in {label}");
     }
     let result = find_needle(&blocks, &needle, &session_id, from, to, ignore_case);
-    Ok(crate::ui::render::scan_agent(
-        &note,
-        &memory_hint(read.memory_label.as_deref()),
-        &result,
-        context,
-    ))
+    Ok(crate::ui::render::scan_agent(&note, &hint, &result, context))
 }
 
 /// Every block of one session, splits de-overlapped. Matching raw chunks would miss a needle that
@@ -989,7 +1443,7 @@ pub async fn scan(
 /// matched. Ordered by position in the session. Empty when the session isn't in the memory.
 async fn reassembled_blocks(ds: &Dataset, session_id: &str, from: Option<i64>, to: Option<i64>) -> Result<Vec<Block>> {
     let cols = ["turn_uuid", "seq", "ts", "block_type", "block_idx", "split_idx", "text"];
-    let mut filter = format!("session_id = '{}'", esc(session_id));
+    let mut filter = dataset::eq("session_id", session_id);
     if let Some(from) = from {
         filter.push_str(&format!(" AND seq >= {from}"));
     }
@@ -1003,28 +1457,32 @@ async fn reassembled_blocks(ds: &Dataset, session_id: &str, from: Option<i64>, t
     let mut blocks: BlockParts = HashMap::new();
     for batch in &batches {
         let (turn, ts, bt, text) = (
-            scol(batch, "turn_uuid"),
-            scol(batch, "ts"),
-            scol(batch, "block_type"),
-            scol(batch, "text"),
+            dataset::strs(batch, "turn_uuid"),
+            dataset::strs(batch, "ts"),
+            dataset::strs(batch, "block_type"),
+            dataset::strs(batch, "text"),
         );
-        let (seq, bi, si) = (icol(batch, "seq"), icol(batch, "block_idx"), icol(batch, "split_idx"));
+        let (seq, bi, si) = (
+            dataset::ints(batch, "seq"),
+            dataset::ints(batch, "block_idx"),
+            dataset::ints(batch, "split_idx"),
+        );
         for i in 0..batch.num_rows() {
-            let key = (ival(seq, i), sval(turn, i), ival(bi, i));
+            let key = (seq.get(i), turn.get(i).to_string(), bi.get(i));
             let entry = blocks.entry(key).or_insert_with(|| {
                 (
                     Block {
-                        turn_uuid: sval(turn, i),
-                        ts: sval(ts, i),
-                        block_type: sval(bt, i),
-                        seq: ival(seq, i),
-                        block_idx: ival(bi, i),
+                        turn_uuid: turn.get(i).to_string(),
+                        ts: ts.get(i).to_string(),
+                        block_type: bt.get(i).to_string(),
+                        seq: seq.get(i),
+                        block_idx: bi.get(i),
                         text: String::new(),
                     },
                     Vec::new(),
                 )
             });
-            entry.1.push((ival(si, i), sval(text, i)));
+            entry.1.push((si.get(i), text.get(i).to_string()));
         }
     }
     drop(batches);
@@ -1198,18 +1656,18 @@ fn age(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
 /// scan omits the line rather than failing status. Never call this for a remote: even a projected
 /// column scan can download an enormous published memory.
 async fn session_count(ds: &Dataset) -> Option<usize> {
-    let batches = dataset::scan_rows(ds, &["session_id"], None, None).await.ok()?;
-    let mut sessions = HashSet::new();
-    for batch in &batches {
-        let col = batch
-            .column_by_name("session_id")?
-            .as_any()
-            .downcast_ref::<StringArray>()?;
-        for i in 0..batch.num_rows() {
-            sessions.insert(col.value(i).to_string());
-        }
-    }
-    Some(sessions.len())
+    dataset::distinct(ds, "session_id", None).await.ok().map(|s| s.len())
+}
+
+async fn pending_embeddings_line(ds: &Dataset) -> Result<String> {
+    let n = dataset::count_rows(ds, Some(dataset::UNEMBEDDED))
+        .await
+        .context("counting chunks awaiting embedding")?;
+    Ok(if n == 0 {
+        String::new()
+    } else {
+        format!("{n} chunk{} awaiting embedding\n", if n == 1 { "" } else { "s" })
+    })
 }
 
 fn index_coverage_line() -> Option<String> {
@@ -1223,100 +1681,161 @@ fn index_coverage_line() -> Option<String> {
     })
 }
 
-/// The indexation lines of a local memory: how many sessions it holds and when it was last
-/// written to (an `index` or `scrub` run). A version with no recorded timestamp is omitted.
-async fn index_lines(ds: &Dataset, now: DateTime<Utc>) -> String {
+/// Each language `languages` counts, with its share, highest first.
+fn language_shares(languages: &dataset::Languages) -> Vec<(String, u64)> {
+    let total: u64 = languages.counts.values().sum();
+    let mut shares: Vec<(String, u64)> = languages
+        .counts
+        .iter()
+        .map(|(code, n)| (code.clone(), (n * 100 + total / 2) / total))
+        .filter(|&(_, share)| share > 0)
+        .collect();
+    shares.sort_by_key(|&(_, share)| Reverse(share));
+    shares
+}
+
+/// `shares` as `eng 75%, por 25%`.
+fn shares_list(shares: &[(String, u64)]) -> String {
+    let shares: Vec<String> = shares.iter().map(|(code, share)| format!("{code} {share}%")).collect();
+    shares.join(", ")
+}
+
+/// The `languages:` status line of a memory holding `rows` chunks, empty when it records none.
+fn languages_line(ds: &Dataset, rows: usize) -> String {
+    let Some(languages) = dataset::languages(ds) else {
+        return String::new();
+    };
+    let shares = language_shares(&languages);
+    if shares.is_empty() {
+        return String::new();
+    }
+    let coverage = if languages.rows == rows as u64 {
+        String::new()
+    } else {
+        format!(" (counted over {} of {rows} chunks)", languages.rows)
+    };
+    format!("languages: {}{coverage}\n", shares_list(&shares))
+}
+
+/// Languages detected across the searched memories, `None` for English alone.
+fn rephrase_languages<'a>(memories: impl IntoIterator<Item = &'a Dataset>) -> Option<String> {
+    let languages: BTreeSet<_> = memories
+        .into_iter()
+        .filter_map(dataset::languages)
+        // A language whose share rounds to 0% is too rare to retry in.
+        .flat_map(|languages| language_shares(&languages))
+        .map(|(code, _)| code)
+        .collect();
+    match languages.len() {
+        0 => None,
+        1 if languages.contains("eng") => None,
+        _ => Some(languages.into_iter().collect::<Vec<_>>().join(", ")),
+    }
+}
+
+/// The local memory's progress and its last write time. A version with no recorded timestamp is
+/// omitted.
+async fn local_memory_lines(ds: &Dataset, now: DateTime<Utc>) -> Result<String> {
     let mut out = String::new();
     if let Some(n) = session_count(ds).await {
         let _ = writeln!(out, "sessions: {n}");
     }
+    out.push_str(&pending_embeddings_line(ds).await?);
     if let Some(line) = index_coverage_line() {
         out.push_str(&line);
     }
-    let t = ds.version().timestamp;
-    if t.timestamp() > 0 {
+    if let Some(t) = dataset::last_write(ds) {
         let _ = writeln!(out, "last indexed: {}", stamp(t, now));
+    }
+    Ok(out)
+}
+
+/// Any other memory, a remote or one at a local path, as it stands: its last write time and its
+/// unindexed backlog.
+async fn other_memory_lines(ds: &Dataset, now: DateTime<Utc>) -> String {
+    let mut out = String::new();
+    if let Some(t) = dataset::last_write(ds) {
+        let _ = writeln!(out, "last write: {}", stamp(t, now));
+    }
+    let unindexed = dataset::max_unindexed_rows(ds).await;
+    if unindexed > 0 {
+        let _ = writeln!(
+            out,
+            "unindexed: {unindexed} chunks (searched brute-force until the next compaction)"
+        );
     }
     out
 }
 
-pub async fn status(memory: Memory) -> Result<String> {
+/// What this host has yet to push to `memory`, a memory an agent here is bound to, from the receipt
+/// `push` keeps: a shared remote's total says nothing about this host's backlog. Without a receipt,
+/// how to start one.
+async fn push_coverage_lines(local: &Dataset, memory: &Memory, uri: &str) -> String {
+    let mut out = String::new();
+    let Some(coverage) = push::local_push_coverage(local, uri).await else {
+        let _ = writeln!(
+            out,
+            "local push coverage: unknown — run `funes push {}` once",
+            memory.label()
+        );
+        return out;
+    };
+    let plural = if coverage.total == 1 { "" } else { "s" };
+    if coverage.pending == 0 {
+        let _ = writeln!(out, "local push: up to date ({} session{plural})", coverage.total);
+        return out;
+    }
+    let _ = writeln!(
+        out,
+        "local push: {} of {} session{plural} pending — run `funes push {}`",
+        coverage.pending,
+        coverage.total,
+        memory.label()
+    );
+    if let Some(held) = &coverage.held {
+        let _ = writeln!(
+            out,
+            "  {} pending row(s) hold secrets ({}) — run `funes scrub` first",
+            held.rows, held.summary
+        );
+    }
+    out
+}
+
+/// The status of what `target` reads: the local memory's progress, and any other memory, a remote
+/// or one at a path, as it stands. A remote reports this host's push coverage only as the bound
+/// memory: coverage is a question only for a memory this host pushes to.
+pub async fn status(target: impl Into<Target>) -> Result<String> {
+    let target = target.into();
+    let bound = target.is_bound();
+    let memory = target.into_memory();
     match open_for_read(&memory).await? {
         ReadOutcome::Ready(ds) => {
             let now = Utc::now();
-            let rows = ds.count_rows(None).await?;
-            let mut out = format!("memory: {}\nchunks: {rows}\n", memory.label());
-            match &memory {
-                Memory::Local { .. } => out.push_str(&index_lines(&ds, now).await),
-                Memory::Remote { uri } => {
-                    // Every write to a remote memory is a `funes push` (data or reindex commit),
-                    // so the head version's timestamp is when it was last pushed to.
-                    let t = ds.version().timestamp;
-                    if t.timestamp() > 0 {
-                        let _ = writeln!(out, "last push: {}", stamp(t, now));
-                    }
-                    let unindexed = crate::memory::remote::max_unindexed_rows(&ds).await;
-                    if unindexed > 0 {
-                        let _ = writeln!(
-                            out,
-                            "unindexed: {unindexed} chunks (searched brute-force until a push reindexes)"
-                        );
-                    }
-                    // The local index is what pushes here — show it alongside, so one status
-                    // answers both "what's published" and "what's indexed on this machine".
-                    if let Ok(local) = Memory::local().open().await {
-                        let local_rows = local.count_rows(None).await?;
-                        let _ = writeln!(
-                            out,
-                            "\nlocal index: {}\nchunks: {local_rows}",
-                            Memory::local().label()
-                        );
-                        let local_sessions = session_count(&local).await;
-                        if let Some(n) = local_sessions {
-                            let _ = writeln!(out, "sessions: {n}");
-                        }
-                        if let Some(line) = index_coverage_line() {
-                            out.push_str(&line);
-                        }
-                        // A shared remote's total says nothing about this host's backlog, so the
-                        // local receipt push maintains is what reports it.
-                        if let Some(coverage) = super::push::local_push_coverage(&local, uri).await
-                        {
-                            if coverage.pending == 0 {
-                                let _ = writeln!(
-                                    out,
-                                    "local push: up to date ({} session{})",
-                                    coverage.total,
-                                    if coverage.total == 1 { "" } else { "s" }
-                                );
-                            } else {
-                                let _ = writeln!(
-                                    out,
-                                    "local push: {} of {} session{} pending — run `funes push {}`",
-                                    coverage.pending,
-                                    coverage.total,
-                                    if coverage.total == 1 { "" } else { "s" },
-                                    memory.label()
-                                );
-                                if let Some(held) = &coverage.held {
-                                    let _ = writeln!(
-                                        out,
-                                        "  {} pending row(s) hold secrets ({}) — run `funes scrub` first",
-                                        held.rows, held.summary
-                                    );
-                                }
-                            }
-                        } else {
-                            let _ = writeln!(
-                                out,
-                                "local push coverage: unknown — run `funes push {}` once",
-                                memory.label()
-                            );
-                        }
-                        let t = local.version().timestamp;
-                        if t.timestamp() > 0 {
-                            let _ = writeln!(out, "last indexed: {}", stamp(t, now));
-                        }
+            let rows = dataset::count_rows(&ds, None).await?;
+            let mut out = format!(
+                "memory: {}\nchunks: {rows}\n{}",
+                memory.label(),
+                languages_line(&ds, rows)
+            );
+            if memory.is_default_local() {
+                out.push_str(&local_memory_lines(&ds, now).await?);
+            } else {
+                out.push_str(&other_memory_lines(&ds, now).await);
+            }
+            if let Memory::Remote { uri } = &memory {
+                // The local index is what pushes here — show it alongside, so one status
+                // answers both "what's published" and "what's indexed on this machine".
+                if let Some(local) = Memory::local().dataset().await? {
+                    let local_rows = dataset::count_rows(&local, None).await?;
+                    let _ = writeln!(
+                        out,
+                        "\nlocal index: {}\nchunks: {local_rows}",
+                        Memory::local().label()
+                    );
+                    out.push_str(&local_memory_lines(&local, now).await?);
+                    if bound {
+                        out.push_str(&push_coverage_lines(&local, &memory, uri).await);
                     }
                 }
             }
@@ -1339,26 +1858,50 @@ pub async fn status(memory: Memory) -> Result<String> {
     }
 }
 
+/// This host's status: the local memory, then the memory it is bound to as it stands, with this
+/// host's push coverage for a remote. `note` is what a host without the binding is told about the
+/// memories an older funes bound its agents to.
+pub async fn host_status(bound: Option<&str>, note: Option<&str>) -> Result<String> {
+    let mut out = status(Memory::local()).await?;
+    if let Some(note) = note {
+        let _ = writeln!(out, "\n{note}");
+    }
+    let Some(spec) = bound else {
+        return Ok(out);
+    };
+    let memory = Memory::parse(spec);
+    let _ = writeln!(out, "\nmemory: {} (bound)", memory.label());
+    let ds = match open_for_read(&memory).await {
+        Ok(ReadOutcome::Ready(ds)) => ds,
+        Ok(ReadOutcome::Offline) => {
+            out.push_str("unreachable\n");
+            return Ok(out);
+        }
+        Ok(ReadOutcome::NoIndex) => return Ok(out),
+        Err(e) => {
+            let _ = writeln!(out, "{e:#}");
+            return Ok(out);
+        }
+    };
+    let rows = dataset::count_rows(&ds, None).await?;
+    let _ = writeln!(out, "chunks: {rows}");
+    out.push_str(&languages_line(&ds, rows));
+    out.push_str(&other_memory_lines(&ds, Utc::now()).await);
+    if let Memory::Remote { uri } = &memory {
+        if let Some(local) = Memory::local().dataset().await? {
+            out.push_str(&push_coverage_lines(&local, &memory, uri).await);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traces::{Block, Turn, FORMAT_VERSION};
+    use arrow_array::RecordBatchIterator;
     use chrono::TimeZone;
-
-    #[test]
-    fn is_scaffolding_flags_wrappers_and_headings() {
-        assert!(is_scaffolding("<ide_opened_file>/foo/bar.rs</ide_opened_file>"));
-        assert!(is_scaffolding("<environment_context>\n  <cwd>/w</cwd>"));
-        assert!(is_scaffolding("   <system-reminder>be nice"));
-        assert!(is_scaffolding("# AGENTS.md instructions for /w\n\n<INSTRUCTIONS>"));
-        assert!(is_scaffolding(
-            "Base directory for this skill: /home/u/.claude/skills/funes\n\n# funes"
-        ));
-        assert!(is_scaffolding(
-            "This session is being continued from a previous conversation that ran out of context."
-        ));
-        assert!(!is_scaffolding("explain me again why funes push finds secrets"));
-        assert!(!is_scaffolding("why did we drop lancedb for funes"));
-    }
+    use std::path::Path;
 
     #[test]
     fn age_picks_the_coarsest_readable_unit() {
@@ -1384,47 +1927,592 @@ mod tests {
         assert_eq!(stamp(t, now), "2026-07-07 13:30 UTC (46 hours ago)");
     }
 
-    #[test]
-    fn esc_doubles_single_quotes() {
-        assert_eq!(esc("o'brien"), "o''brien");
-        assert_eq!(esc("plain"), "plain");
+    /// A memory holding `turns`, written to a temp dir.
+    async fn memory_of(turns: &[Turn], dir: &Path) -> Dataset {
+        let chunks = chunk::chunks_from_turns(turns, true);
+        let vectors = vec![vec![0.0f32; dataset::DIM as usize]; chunks.len()];
+        let batch = dataset::build_batch(dataset::model::ENGLISH, &chunks, Some(&vectors)).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], dataset::schema(dataset::model::ENGLISH));
+        Dataset::write(reader, dir.to_str().unwrap(), None).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn recall_requires_fts_even_when_vector_candidates_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = memory_of(
+            &[text_turn("session", 0, "user", "A narwhal parses transcripts.")],
+            dir.path(),
+        )
+        .await;
+        let qv = vec![1.0; dataset::DIM as usize];
+        assert_eq!(vector_candidates(&ds, &qv, 5, None).await.unwrap().len(), 1);
+        assert!(
+            hybrid_candidates(&ds, &qv, "narwhal", 5, None).await.is_err(),
+            "a missing FTS index must fail recall even when vector search finds a candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_memory_lines_count_pending_embeddings_until_they_are_filled() {
+        let dir = tempfile::tempdir().unwrap();
+        let turns = [
+            text_turn("session", 0, "user", "A narwhal parses transcripts."),
+            text_turn("session", 1, "assistant", "Each line becomes a typed turn."),
+        ];
+        let chunks = chunk::chunks_from_turns(&turns, true);
+        let batch = dataset::build_batch(dataset::model::ENGLISH, &chunks, None).unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], dataset::schema(dataset::model::ENGLISH));
+        let mut ds = Dataset::write(reader, &dataset::table_uri(dir.path()), None)
+            .await
+            .unwrap();
+        let now = Utc::now();
+
+        for (chunk, line) in chunks
+            .iter()
+            .zip(["2 chunks awaiting embedding\n", "1 chunk awaiting embedding\n"])
+        {
+            let out = local_memory_lines(&ds, now).await.unwrap();
+            assert!(out.starts_with(&format!("sessions: 1\n{line}")), "{out}");
+            ds = dataset::fill_vectors(&ds, &[chunk.id.as_str()], &[vec![0.0; dataset::DIM as usize]])
+                .await
+                .unwrap();
+        }
+        let out = local_memory_lines(&ds, now).await.unwrap();
+        assert!(out.starts_with("sessions: 1\n"), "{out}");
+        assert!(!out.contains("awaiting embedding"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn status_lists_a_memorys_languages_highest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Memory::parse(&dir.path().to_string_lossy());
+        let turns = [text_turn("session", 0, "user", "A narwhal parses transcripts.")];
+        let batch =
+            dataset::build_batch(dataset::model::ENGLISH, &chunk::chunks_from_turns(&turns, true), None).unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], dataset::schema(dataset::model::ENGLISH));
+        let mut ds = Dataset::write(reader, &dataset::table_uri(memory.label()), None)
+            .await
+            .unwrap();
+        let counts = BTreeMap::from([
+            ("eng".to_string(), 296),
+            ("lat".to_string(), 1),
+            ("por".to_string(), 100),
+        ]);
+        dataset::stamp_languages(&mut ds, &dataset::Languages { rows: 1, counts })
+            .await
+            .unwrap();
+        let prefix = format!("memory: {}\nchunks: 1\nlanguages: eng 75%, por 25%\n", memory.label());
+        let out = status(memory).await.unwrap();
+        assert!(out.starts_with(&prefix), "{out}");
+    }
+
+    #[tokio::test]
+    async fn status_says_when_language_counts_miss_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Memory::parse(&dir.path().to_string_lossy());
+        let turns = [
+            text_turn("session", 0, "user", "A narwhal parses transcripts."),
+            text_turn("session", 1, "assistant", "Each line becomes a typed turn."),
+        ];
+        let batch =
+            dataset::build_batch(dataset::model::ENGLISH, &chunk::chunks_from_turns(&turns, true), None).unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], dataset::schema(dataset::model::ENGLISH));
+        let mut ds = Dataset::write(reader, &dataset::table_uri(memory.label()), None)
+            .await
+            .unwrap();
+        let counts = BTreeMap::from([("eng".to_string(), 1)]);
+        dataset::stamp_languages(&mut ds, &dataset::Languages { rows: 1, counts })
+            .await
+            .unwrap();
+        let out = status(memory).await.unwrap();
+        assert!(
+            out.contains("\nlanguages: eng 100% (counted over 1 of 2 chunks)\n"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_miss_names_the_searched_languages_unless_english_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let turns = [text_turn("session", 0, "user", "A narwhal parses transcripts.")];
+        let mut ds = memory_of(&turns, dir.path()).await;
+        assert_eq!(rephrase_languages([&ds]), None);
+        for (counts, named) in [
+            (BTreeMap::from([("eng".to_string(), 9)]), None),
+            (BTreeMap::from([("eng".to_string(), 999), ("ita".to_string(), 1)]), None),
+            (
+                BTreeMap::from([("eng".to_string(), 3), ("por".to_string(), 1)]),
+                Some("eng, por"),
+            ),
+        ] {
+            let previous = ds.clone();
+            dataset::stamp_languages(&mut ds, &dataset::Languages { rows: 1, counts })
+                .await
+                .unwrap();
+            assert_eq!(rephrase_languages([&ds]).as_deref(), named);
+            assert_eq!(rephrase_languages([&previous, &ds, &ds]).as_deref(), named);
+        }
+    }
+
+    fn text_turn(session: &str, seq: i64, role: &str, text: &str) -> Turn {
+        Turn {
+            format: FORMAT_VERSION,
+            session_id: session.into(),
+            cwd: None,
+            workdir: String::new(),
+            turn_uuid: format!("{session}-{seq}"),
+            parent_uuid: None,
+            seq,
+            ts: "2026-01-01T00:00:00Z".into(),
+            role: role.into(),
+            blocks: vec![Block {
+                block_type: "text".into(),
+                text: text.into(),
+                tool_name: None,
+                tool_use_id: None,
+            }],
+            source_path: String::new(),
+            harness: "t".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn first_prompts_open_on_user_text_else_the_first_text_of_any_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let turns = [
+            // An agent session: the first non-scaffolding user text, not the earlier scaffolding.
+            text_turn("agent", 0, "user", "<system-reminder>…</system-reminder>"),
+            text_turn("agent", 1, "user", "how do we parse transcripts"),
+            text_turn("agent", 2, "assistant", "with serde"),
+            // A tracker thread: no `user` turn at all — the first text block opens it.
+            text_turn("issue", 0, "contributor", "**@someone** opened: build fails on arm64"),
+            text_turn("issue", 1, "member", "reproduced on main"),
+            // Only scaffolding user text: nothing opens it, a reply is not a prompt.
+            text_turn("scaffold", 0, "user", "# skill preamble"),
+            text_turn("scaffold", 1, "assistant", "ok"),
+        ];
+        let ds = memory_of(&turns, dir.path()).await;
+        let ids: Vec<String> = ["agent", "issue", "scaffold"].map(String::from).to_vec();
+        let prompts = first_prompts(&ds, &ids).await.unwrap();
+        assert_eq!(prompts["agent"], "how do we parse transcripts");
+        assert_eq!(prompts["issue"], "**@someone** opened: build fails on arm64");
+        assert!(!prompts.contains_key("scaffold"), "{prompts:?}");
+    }
+
+    /// A turn of session `s` holding one block of `block_type`.
+    fn block_turn(seq: i64, role: &str, block_type: &str, text: &str) -> Turn {
+        let mut turn = text_turn("s", seq, role, text);
+        turn.blocks[0].block_type = block_type.into();
+        turn
+    }
+
+    /// The block types of the pool a search of `memory` for `query` cuts, sorted. The pool is no
+    /// larger than the hits, so no reranker runs, and the query's vector is set, so no embedder
+    /// loads.
+    async fn pool_types(memory: &Memory, query: &str, candidates: usize, block_type: Option<&str>) -> Vec<String> {
+        let filter = RecallFilter {
+            block_type: block_type.map(String::from),
+            ..Default::default()
+        };
+        let search = Search::new(query.into(), candidates, filter).unwrap();
+        assert!(search
+            .qv
+            .set((dataset::model::ENGLISH, vec![1.0; dataset::DIM as usize]))
+            .is_ok());
+        let pool = search.candidates(memory, &|_| ()).await.unwrap();
+        let ranked = search.rank(vec![pool], candidates, &|_| ()).await.unwrap();
+        let mut types: Vec<String> = ranked.hits.into_iter().map(|(h, _)| h.block_type).collect();
+        types.sort();
+        types
+    }
+
+    #[tokio::test]
+    async fn tool_output_matching_the_query_best_leaves_room_for_the_prose() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Memory::parse(&dir.path().to_string_lossy());
+        let turns = [
+            block_turn(0, "user", "tool_result", "walrus parser walrus parser"),
+            block_turn(1, "user", "tool_result", "walrus parser walrus"),
+            block_turn(2, "user", "tool_result", "walrus parser"),
+            block_turn(3, "assistant", "text", "we dropped the walrus"),
+        ];
+        let chunks = chunk::chunks_from_turns(&turns, true);
+        // No vectors: the text search alone ranks, and it ranks every tool result above the text.
+        let batch = dataset::build_batch(dataset::model::ENGLISH, &chunks, None).unwrap();
+        let reader = RecordBatchIterator::new([Ok(batch)], dataset::schema(dataset::model::ENGLISH));
+        let mut ds = Dataset::write(reader, &dataset::table_uri(memory.label()), None)
+            .await
+            .unwrap();
+        dataset::build_indexes(&mut ds, |_| {}).await.unwrap();
+
+        assert_eq!(
+            pool_types(&memory, "walrus parser", 2, None).await,
+            ["text", "tool_result"]
+        );
+        assert_eq!(
+            pool_types(&memory, "walrus parser", 3, None).await,
+            ["text", "tool_result", "tool_result"],
+            "a type that runs out leaves its share to the others"
+        );
+        assert_eq!(
+            pool_types(&memory, "walrus parser", 2, Some("tool_result")).await,
+            ["tool_result", "tool_result"],
+            "a search of one type fills the pool with it"
+        );
     }
 
     #[test]
-    fn memory_hint_names_the_read_memory() {
+    fn a_pool_larger_than_the_hits_is_reranked() {
+        assert!(reranks(DEFAULT_K, DEFAULT_CANDIDATES), "the defaults rerank");
+        assert!(reranks(8, 9));
+        assert!(!reranks(8, 8), "a pool of the hits is read whole");
+        assert!(!reranks(8, 3), "a pool short of the hits too");
+        assert!(!reranks(30, 30));
+    }
+
+    /// The `limit` cut usually lands inside a tie, and `scores` is a HashMap whose order is seeded
+    /// per process, so fusion has to impose a total order of its own: same lists, same rows, same
+    /// order, every run.
+    #[test]
+    fn rrf_fuse_settles_ties_by_row_id() {
+        let hit = |id: u64| Hit {
+            id: id.to_string(),
+            text: id.to_string(),
+            session_id: String::new(),
+            workdir: String::new(),
+            turn_uuid: String::new(),
+            seq: 0,
+            ts: String::new(),
+            block_type: String::new(),
+            harness: String::new(),
+            exchange: Vec::new(),
+            memory: String::new(),
+            fused: 0.0,
+        };
+        // Disjoint lists: vector row 2i and FTS row 2i+1 both sit at rank i, so every rank ties.
+        let lists = || {
+            let v: Vec<(u64, Hit)> = (0..20).map(|i| (2 * i, hit(2 * i))).collect();
+            let f: Vec<(u64, Hit)> = (0..20).map(|i| (2 * i + 1, hit(2 * i + 1))).collect();
+            (v, f)
+        };
+        let ids = |hits: Vec<Hit>| hits.into_iter().map(|h| h.text).collect::<Vec<_>>();
+
+        let (v, f) = lists();
+        let want: Vec<String> = (0..40).map(|i: u64| i.to_string()).collect();
+        assert_eq!(ids(rrf_fuse(v, f, 40)), want, "fused order is not the tie-broken order");
+
+        // The cut through a tie takes the same rows every run, not an arbitrary half of it.
+        let (v, f) = lists();
+        assert_eq!(ids(rrf_fuse(v, f, 5)), ["0", "1", "2", "3", "4"]);
+    }
+
+    #[test]
+    fn search_hits_break_score_ties_before_fusion() {
+        use arrow_array::{ArrayRef, Float32Array, StringArray, UInt64Array};
+        use std::sync::Arc;
+
+        let batch = |score_column, rows: &[(u64, f32)]| {
+            RecordBatch::try_from_iter([
+                (
+                    "_rowid",
+                    Arc::new(UInt64Array::from_iter_values(rows.iter().map(|(id, _)| *id))) as ArrayRef,
+                ),
+                (
+                    "id",
+                    Arc::new(StringArray::from_iter_values(rows.iter().map(|(id, _)| id.to_string()))) as ArrayRef,
+                ),
+                (
+                    score_column,
+                    Arc::new(Float32Array::from_iter_values(rows.iter().map(|(_, score)| *score))) as ArrayRef,
+                ),
+            ])
+            .unwrap()
+        };
+
+        for (score_column, best, worse) in [("_distance", 0.0, 0.5), ("_score", 0.5, 0.0)] {
+            // Lance may deliver the same score tie in either order and across batches.
+            for (a, b) in [(11, 3), (3, 11)] {
+                let batches = [
+                    batch(score_column, &[(a, best)]),
+                    batch(score_column, &[(b, best), (1, worse)]),
+                ];
+                let hits = hits_of(&batches).unwrap();
+                let row_ids: Vec<_> = hits.iter().map(|(id, _)| *id).collect();
+                assert_eq!(row_ids, [3, 11, 1], "{score_column}");
+                assert_eq!(rrf_fuse(hits, vec![], 1)[0].id, "3");
+            }
+        }
+    }
+
+    #[test]
+    fn share_by_type_takes_each_types_next_row_in_turn() {
+        // (block type, fused score), best first.
+        let rows = [
+            ("tool_result", 0.05),
+            ("tool_result", 0.04),
+            ("tool_use", 0.03),
+            ("text", 0.02),
+            ("tool_result", 0.015),
+            ("text", 0.01),
+        ];
+        let hits = || -> Vec<(usize, Hit)> {
+            rows.iter()
+                .enumerate()
+                .map(|(i, (block_type, fused))| {
+                    let hit = Hit {
+                        id: i.to_string(),
+                        text: String::new(),
+                        session_id: String::new(),
+                        workdir: String::new(),
+                        turn_uuid: String::new(),
+                        seq: 0,
+                        ts: String::new(),
+                        block_type: block_type.to_string(),
+                        harness: String::new(),
+                        exchange: Vec::new(),
+                        memory: String::new(),
+                        fused: *fused,
+                    };
+                    (0, hit)
+                })
+                .collect()
+        };
+        let ids = |hits: Vec<(usize, Hit)>| hits.into_iter().map(|(_, h)| h.id).collect::<Vec<_>>();
+        assert_eq!(ids(share_by_type(hits(), 6)), ["0", "2", "3", "1", "5", "4"]);
         assert_eq!(
-            memory_hint(Some("hf://datasets/acme/kb")),
-            " --memory hf://datasets/acme/kb"
+            ids(share_by_type(hits(), 4)),
+            ["0", "2", "3", "1"],
+            "the extra row of an uneven share goes to the type whose next row scores higher"
         );
-        // A hit with no memory label yields no suffix.
-        assert_eq!(memory_hint(None), "");
+    }
+
+    #[test]
+    fn a_search_covers_each_block_type_unless_the_filter_names_one() {
+        let clauses = |block_type: Option<&str>, role: Option<&str>| {
+            let filter = RecallFilter {
+                block_type: block_type.map(String::from),
+                role: role.map(String::from),
+                ..Default::default()
+            };
+            Search::new("q".into(), 30, filter).unwrap().where_clauses
+        };
+        let each = |rest: &str| -> Vec<String> {
+            traces::BLOCK_TYPES
+                .iter()
+                .map(|bt| format!("block_type = '{bt}'{rest}"))
+                .collect()
+        };
+        assert_eq!(clauses(None, None), each(""));
+        assert_eq!(clauses(None, Some("user")), each(" AND role = 'user'"));
+        assert_eq!(
+            clauses(Some("text"), Some("user")),
+            ["block_type = 'text' AND role = 'user'"]
+        );
+    }
+
+    #[test]
+    fn harness_spellings_cover_both_names_of_a_known_agent_and_pass_others_through() {
+        assert_eq!(harness_spellings("claude".into()), ["claude_code", "claude"]);
+        assert_eq!(harness_spellings("claude_code".into()), ["claude_code", "claude"]);
+        assert_eq!(harness_spellings("codex".into()), ["codex"]);
+        assert_eq!(harness_spellings("opencode".into()), ["opencode"]);
     }
 
     #[test]
     fn build_where_combines_set_filters() {
-        assert_eq!(build_where(None, None), None);
-        assert_eq!(build_where(Some("text"), None).as_deref(), Some("block_type = 'text'"));
-        assert_eq!(build_where(None, Some("codex")).as_deref(), Some("harness = 'codex'"));
+        let one = |h: &str| vec![h.to_string()];
+        let any = DayRange::default();
+        let w = |bt: &str, r: Option<&str>, h: &[String], d: &DayRange| build_where(bt, r, h, None, d).unwrap();
+        assert_eq!(w("text", None, &[], &any), "block_type = 'text'");
         assert_eq!(
-            build_where(Some("tool_use"), Some("pi")).as_deref(),
-            Some("block_type = 'tool_use' AND harness = 'pi'")
+            w("text", Some("user"), &[], &any),
+            "block_type = 'text' AND role = 'user'"
         );
-        // values are escaped against filter-string injection.
-        assert_eq!(build_where(None, Some("a'b")).as_deref(), Some("harness = 'a''b'"));
+        assert_eq!(
+            w("text", None, &one("codex"), &any),
+            "block_type = 'text' AND harness = 'codex'"
+        );
+        assert_eq!(
+            w("tool_use", None, &one("pi"), &any),
+            "block_type = 'tool_use' AND harness = 'pi'"
+        );
+        assert_eq!(
+            w("text", Some("user"), &one("pi"), &any),
+            "block_type = 'text' AND role = 'user' AND harness = 'pi'"
+        );
+        assert_eq!(
+            w("text", None, &harness_spellings("claude".into()), &any),
+            "block_type = 'text' AND harness IN ('claude_code', 'claude')"
+        );
+        // A day range is inclusive: the upper clause is the day after `until`, exclusive.
+        let week = DayRange {
+            since: Some("2026-09-14"),
+            until: Some("2026-09-20"),
+        };
+        assert_eq!(
+            w("text", None, &[], &week),
+            "block_type = 'text' AND ts >= '2026-09-14' AND ts < '2026-09-21'"
+        );
+        let year_end = DayRange {
+            since: None,
+            until: Some("2026-12-31"),
+        };
+        assert_eq!(
+            w("text", None, &[], &year_end),
+            "block_type = 'text' AND ts < '2027-01-01'"
+        );
+        // A repo is one word of the space-joined column.
+        assert_eq!(
+            build_where("text", None, &[], Some("acme/widget"), &week).unwrap(),
+            "block_type = 'text' AND concat(' ', repo, ' ') LIKE '% acme/widget %' AND ts >= '2026-09-14' AND ts < '2026-09-21'"
+        );
+        // values are escaped against filter-string injection; a bound that is not a date is refused.
+        assert_eq!(
+            w("text", None, &one("a'b"), &any),
+            "block_type = 'text' AND harness = 'a''b'"
+        );
+        assert_eq!(
+            w("text", Some("a'b"), &[], &any),
+            "block_type = 'text' AND role = 'a''b'"
+        );
+        assert_eq!(
+            build_where("text", None, &[], Some("o'k/a_b%c\\d"), &any).unwrap(),
+            "block_type = 'text' AND concat(' ', repo, ' ') LIKE '% o''k/a\\_b\\%c\\\\d %'"
+        );
+        let err = build_where(
+            "text",
+            None,
+            &[],
+            None,
+            &DayRange {
+                since: Some("x'y"),
+                until: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("expected YYYY-MM-DD"), "{err}");
+        // So is a date in another spelling: the text compare on `ts` needs the zero padding.
+        let unpadded = DayRange {
+            since: Some("2026-9-14"),
+            until: None,
+        };
+        assert!(build_where("text", None, &[], None, &unpadded).is_err());
+        assert!(unpadded.check().is_err());
+        // And a repo that is not one `owner/name`, which no row's identities could hold.
+        for repo in [
+            "",
+            "funes",
+            "/funes",
+            "acme/",
+            "github.com/acme/widget",
+            "acme/widget upstream/widget",
+        ] {
+            let err = build_where("text", None, &[], Some(repo), &any).unwrap_err();
+            assert!(err.to_string().contains("expected owner/name"), "{repo:?}: {err}");
+        }
+    }
+
+    /// A memory of one turn per `(session, repo)`, all saying the same thing, with its text index.
+    async fn memory_of_repos(repos: &[(&str, &str)], dir: &Path) -> Dataset {
+        let turns: Vec<Turn> = repos
+            .iter()
+            .map(|(session, _)| text_turn(session, 0, "user", "A narwhal parses transcripts."))
+            .collect();
+        let mut chunks = chunk::chunks_from_turns(&turns, true);
+        for c in &mut chunks {
+            let (_, repo) = repos.iter().find(|(session, _)| *session == c.session_id).unwrap();
+            c.repo = repo.to_string();
+        }
+        let vectors = vec![vec![0.0f32; dataset::DIM as usize]; chunks.len()];
+        let batch = dataset::build_batch(dataset::model::ENGLISH, &chunks, Some(&vectors)).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], dataset::schema(dataset::model::ENGLISH));
+        let mut ds = Dataset::write(reader, dir.to_str().unwrap(), None).await.unwrap();
+        dataset::build_indexes(&mut ds, |_| {}).await.unwrap();
+        ds
+    }
+
+    #[tokio::test]
+    async fn a_repo_keeps_the_turns_whose_checkout_names_it_among_its_remotes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ds = memory_of_repos(
+            &[
+                ("fork", "acme/widget upstream/widget"),
+                ("look-alike", "acme/widgets"),
+                ("other", "acme/gadget"),
+                ("unresolved", ""),
+            ],
+            dir.path(),
+        )
+        .await;
+        let qv = vec![1.0; dataset::DIM as usize];
+        for (repo, want) in [
+            ("acme/widget", &["fork"][..]),
+            ("upstream/widget", &["fork"]),
+            ("acme/widgets", &["look-alike"]),
+            ("acme/gadget", &["other"]),
+            // A `_` or `%` matches only itself.
+            ("acme/widge_", &[]),
+            ("acme/%", &[]),
+        ] {
+            let filter = build_where("text", None, &[], Some(repo), &DayRange::default()).unwrap();
+            // Both legs prefilter, so each must keep exactly the repo's turns on its own.
+            let by_vector = vector_candidates(&ds, &qv, 10, Some(&filter)).await.unwrap();
+            let by_text = fts_candidates(&ds, "narwhal", 10, Some(&filter)).await.unwrap();
+            for (leg, hits) in [("vector", by_vector), ("text", by_text)] {
+                let mut sessions: Vec<String> = hits.into_iter().map(|(_, h)| h.session_id).collect();
+                sessions.sort();
+                assert_eq!(sessions, want, "{leg} search for {repo}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repo_on_a_memory_without_the_column_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = Memory::parse(&dir.path().to_string_lossy());
+        let mut ds = memory_of_repos(
+            &[("session", "acme/widget")],
+            Path::new(&dataset::table_uri(memory.label())),
+        )
+        .await;
+        ds.drop_columns(&["repo"]).await.unwrap();
+        let search = Search::new(
+            "narwhal".into(),
+            DEFAULT_CANDIDATES,
+            RecallFilter {
+                repo: Some("acme/widget".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let err = search.candidates(&memory, &|_| ()).await.err().expect("a refusal");
+        assert!(err.to_string().contains("predates the repo facet"), "{err}");
     }
 
     #[test]
-    fn recency_weight_halves_each_half_life() {
-        let now = Utc.with_ymd_and_hms(2026, 1, 31, 0, 0, 0).unwrap();
-        // disabled
-        assert_eq!(recency_weight("2026-01-01T00:00:00Z", now, 0.0), 1.0);
-        // fresh
-        assert!((recency_weight("2026-01-31T00:00:00Z", now, 30.0) - 1.0).abs() < 1e-9);
-        // exactly one half-life (30 days) old -> 0.5
-        assert!((recency_weight("2026-01-01T00:00:00Z", now, 30.0) - 0.5).abs() < 1e-9);
-        // future timestamps clamp to fresh, not >1.
-        assert!((recency_weight("2026-02-10T00:00:00Z", now, 30.0) - 1.0).abs() < 1e-9);
-        // unparseable -> neutral 1.0
-        assert_eq!(recency_weight("not-a-date", now, 30.0), 1.0);
+    fn day_range_is_inclusive_at_both_ends_and_open_without_a_bound() {
+        let week = DayRange {
+            since: Some("2026-09-14"),
+            until: Some("2026-09-20"),
+        };
+        assert!(week.holds("2026-09-14T00:00:00Z"));
+        assert!(week.holds("2026-09-20T23:59:59Z"));
+        assert!(!week.holds("2026-09-13T23:59:59Z"));
+        assert!(!week.holds("2026-09-21T00:00:00Z"));
+        assert!(DayRange::default().holds("1999-01-01T00:00:00Z"));
+        assert!(DayRange {
+            since: Some("2026-09-14"),
+            until: None
+        }
+        .holds("2030-01-01T00:00:00Z"));
+        // The filter clauses draw the same line: `ts >= since` and `ts < the day after until`.
+        for ts in [
+            "2026-09-13T23:59:59Z",
+            "2026-09-14T00:00:00Z",
+            "2026-09-20T23:59:59.999Z",
+            "2026-09-21T00:00:00Z",
+        ] {
+            assert_eq!(week.holds(ts), ("2026-09-14".."2026-09-21").contains(&ts), "{ts}");
+        }
     }
 }

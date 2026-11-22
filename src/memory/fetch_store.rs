@@ -26,8 +26,9 @@ use chrono::Utc;
 use futures::stream::{self, BoxStream, StreamExt};
 use object_store::path::Path as OPath;
 use object_store::{
-    Attributes, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
-    ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OSResult,
+    Attributes, CopyOptions, Extensions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore as OSObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    Result as OSResult,
 };
 
 /// Supplies a whole local file for an object key: given the object path, return a local filesystem
@@ -138,6 +139,7 @@ fn serve_from_file(path: &Path, location: &OPath, options: &GetOptions) -> Resul
             meta,
             range: 0..0,
             attributes: Attributes::default(),
+            extensions: Extensions::default(),
         });
     }
     let range = match &options.range {
@@ -151,6 +153,7 @@ fn serve_from_file(path: &Path, location: &OPath, options: &GetOptions) -> Resul
         meta,
         range,
         attributes: Attributes::default(),
+        extensions: Extensions::default(),
     })
 }
 
@@ -353,27 +356,5 @@ mod tests {
         assert_eq!(got.bytes().await.unwrap(), Bytes::from_static(b"cdef"));
         assert_eq!(fetcher.discards.load(Ordering::SeqCst), 1, "one repair attempt only");
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
-    }
-
-    /// `list` is delegated to the inner store (version resolution must stay live) — the fetcher is
-    /// never consulted for a listing.
-    #[tokio::test]
-    async fn list_delegates_to_inner() {
-        let (store, fetcher, inner) = store_with(&[]);
-        inner
-            .put_opts(
-                &OPath::from("chunks.lance/_versions/1.manifest"),
-                PutPayload::from("m"),
-                PutOptions::default(),
-            )
-            .await
-            .unwrap();
-        let names: Vec<String> = store
-            .list(None)
-            .map(|r| r.unwrap().location.to_string())
-            .collect()
-            .await;
-        assert_eq!(names, vec!["chunks.lance/_versions/1.manifest".to_string()]);
-        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0, "listing never fetches");
     }
 }

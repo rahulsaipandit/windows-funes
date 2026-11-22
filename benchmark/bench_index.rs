@@ -1,97 +1,164 @@
-//! Benchmark `funes index <source>`: build time, embedding throughput, and the compactness of the
-//! resulting memory. Useful for tracking the parquet bulk-import path (one append, one Lance fragment) and
-//! catching regressions like per-session appends bloating the memory.
-//!
-//! The index is built into a throwaway `$FUNES_HOME` so your real memory and config are untouched
-//! (no remote is attached there, so no push fires).
+//! Time the part of `funes index` that writes rows, in a scratch memory:
 //!
 //! ```text
-//! cargo run --release --example bench_index -- path/to/traces.parquet
-//! cargo run --release --example bench_index -- ~/.claude/projects   # a JSONL tree
+//! cargo run --release --example bench_index -- --sessions 2000 2>/dev/null
+//! cargo run --release --example bench_index -- --dir path/to/turns --limit 5000 2>/dev/null
 //! ```
 //!
-//! Elapsed includes the one-time embedding-model load (~1-2s), so reported throughput is a slight
-//! under-estimate on small inputs and accurate on large ones.
+//! An index run writes every session's rows, embeds them, then compacts the memory. The embedding
+//! takes the longest and does not depend on how the rows are written, so this leaves it out and
+//! times the rest: writing the rows (reading each turns file, chunking it, appending its rows,
+//! recording its state), then the end of the run (the language counts and the compaction). Both
+//! grow with the number of sessions as well as with their size, so a history of many short sessions
+//! is where they show.
+//!
+//! The corpus is generated, `--sessions` sessions of `--turns` turns that are the same on every run,
+//! or a directory of turns files given with `--dir`, of which `--limit` keeps the most recent
+//! sessions. The indexer reports each session and the compaction on stderr.
+
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use arrow_array::{Array, StringArray};
 use clap::Parser;
-use funes::commands::index::run_index;
-use funes::memory::Memory;
-use futures::TryStreamExt;
-use std::collections::HashSet;
-use std::path::PathBuf;
-use std::time::Instant;
-use walkdir::WalkDir;
 
 #[derive(Parser)]
-#[command(about = "Benchmark index build: time, throughput, memory compactness")]
 struct Args {
-    /// Source to index: a `.parquet` trace dataset or a directory of JSONL transcripts.
-    source: PathBuf,
-    /// Index at most this many sessions, to bound build time. Raise it for a longer, steadier run.
-    #[arg(long, default_value_t = 500)]
+    /// Sessions to generate.
+    #[arg(long, default_value_t = 2000, conflicts_with = "dir")]
     sessions: usize,
-    /// Exclude thinking blocks (passed through to `index`).
+    /// Turns per generated session.
+    #[arg(long, default_value_t = 12, conflicts_with = "dir")]
+    turns: usize,
+    /// A directory of turns files to index instead of a generated corpus.
     #[arg(long)]
-    no_thinking: bool,
+    dir: Option<PathBuf>,
+    /// Index only the directory's most recent N sessions.
+    #[arg(long, requires = "dir")]
+    limit: Option<usize>,
 }
 
-/// Total bytes of every file under `dir`.
-fn dir_bytes(dir: &std::path::Path) -> u64 {
-    WalkDir::new(dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.metadata().ok())
-        .filter(|m| m.is_file())
-        .map(|m| m.len())
-        .sum()
+/// The words a generated turn is drawn from.
+const WORDS: [&str; 48] = [
+    "the",
+    "index",
+    "writes",
+    "rows",
+    "for",
+    "each",
+    "session",
+    "and",
+    "then",
+    "embeds",
+    "them",
+    "while",
+    "recall",
+    "reads",
+    "chunks",
+    "back",
+    "from",
+    "a",
+    "memory",
+    "on",
+    "disk",
+    "with",
+    "its",
+    "turns",
+    "in",
+    "order",
+    "so",
+    "an",
+    "agent",
+    "can",
+    "find",
+    "what",
+    "was",
+    "decided",
+    "before",
+    "about",
+    "this",
+    "repository",
+    "build",
+    "test",
+    "run",
+    "error",
+    "fix",
+    "plan",
+    "review",
+    "answer",
+    "question",
+    "user",
+];
+
+/// An xorshift generator with a fixed seed, so a generated corpus is the same on every run.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 % n as u64) as usize
+    }
+}
+
+/// Write `sessions` turns files of `turns` turns each into `dir`, a turn of 40 to 400 words.
+fn generate(dir: &Path, sessions: usize, turns: usize) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    for s in 0..sessions {
+        let session_id = format!("bench-{s:06}");
+        let mut file = String::new();
+        for seq in 0..turns {
+            let words: Vec<&str> = (0..40 + rng.below(361))
+                .map(|_| WORDS[rng.below(WORDS.len())])
+                .collect();
+            let turn = serde_json::json!({
+                "session_id": session_id,
+                "turn_uuid": format!("t{seq}"),
+                "seq": seq,
+                "ts": "2026-01-01T00:00:00Z",
+                "role": if seq % 2 == 0 { "user" } else { "assistant" },
+                "harness": "bench",
+                "blocks": [{"block_type": "text", "text": words.join(" ")}],
+            });
+            file.push_str(&turn.to_string());
+            file.push('\n');
+        }
+        std::fs::write(dir.join(format!("{session_id}.funes.jsonl")), file)?;
+    }
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let a = Args::parse();
-
-    // Build into a throwaway FUNES_HOME (held alive for the run): the real memory/config are untouched
-    // and, with no remote attached there, `index` won't push.
-    let home = tempfile::Builder::new().prefix("funes-bench-index-").tempdir()?;
-    std::env::set_var("FUNES_HOME", home.path());
-
-    let t = Instant::now();
-    run_index(a.source.as_path(), a.no_thinking, Some(a.sessions)).await?;
-    let secs = t.elapsed().as_secs_f64();
-
-    // Inspect the built memory: chunks (rows), distinct sessions, on-disk size, and Lance fragments —
-    // three different granularities, so the output shows they don't coincide.
-    let memory = home.path().join("memory");
-    let ds = Memory::local().open().await?;
-    let chunks = ds.count_rows(None).await?;
-    let mut scan = ds.scan();
-    scan.project(&["session_id"])?;
-    let mut stream = scan.try_into_stream().await?;
-    let mut sids = HashSet::new();
-    while let Some(batch) = stream.try_next().await? {
-        if let Some(col) = batch
-            .column_by_name("session_id")
-            .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        {
-            (0..col.len()).filter(|&i| !col.is_null(i)).for_each(|i| {
-                sids.insert(col.value(i).to_string());
-            });
+    let args = Args::parse();
+    let scratch = tempfile::tempdir()?;
+    let (dir, corpus) = match &args.dir {
+        Some(dir) => {
+            let kept = args.limit.map(|n| format!(", its {n} most recent sessions"));
+            (dir.clone(), format!("{}{}", dir.display(), kept.unwrap_or_default()))
         }
-    }
-    let sessions = sids.len();
-    let mb = dir_bytes(&memory) as f64 / 1e6;
-    let data = memory.join("chunks.lance").join("data");
-    let fragments = std::fs::read_dir(&data).map(|d| d.count()).unwrap_or(0);
-
-    println!("\n=== index benchmark ===");
-    println!("source:           {}", a.source.display());
-    println!("elapsed:          {secs:.1}s  (incl. model load)");
-    println!("sessions:         {sessions}");
-    println!("chunks:           {chunks}");
-    println!("throughput:       {:.0} chunks/s", chunks as f64 / secs.max(0.001));
-    println!("memory size:      {mb:.0} MB");
-    println!("lance fragments:  {fragments}");
+        None => {
+            let dir = scratch.path().join("turns");
+            generate(&dir, args.sessions, args.turns)?;
+            (
+                dir,
+                format!("{} generated sessions of {} turns", args.sessions, args.turns),
+            )
+        }
+    };
+    // A scratch home: the run builds a memory of its own and leaves yours alone.
+    std::env::set_var("FUNES_HOME", scratch.path().join("funes"));
+    let run = funes::commands::index::write_rows(&dir, args.limit).await?;
+    let write = run.write.as_secs_f64();
+    println!("\ncorpus: {corpus}");
+    println!(
+        "rows: {} sessions, {} chunks in {write:.1} s, {:.1} sessions/s",
+        run.sessions,
+        run.chunks,
+        run.sessions as f64 / write
+    );
+    println!("left: {} fragments to merge", run.fragments);
+    println!("end of run: {:.1} s", run.finalize.as_secs_f64());
     Ok(())
 }
