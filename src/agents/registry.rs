@@ -531,13 +531,34 @@ impl Integration {
         let command = super::shell_command(&setup.to_string_lossy(), args);
         // What the integration records or invokes: the user's pin, else `funes` from PATH.
         let funes = std::env::var("FUNES_BIN").unwrap_or_else(|_| "funes".to_string());
-        let status = Command::new(&setup)
+        // Windows port: a `#!/bin/sh` file is not a program there, so run it through `sh` (Git Bash).
+        #[cfg(windows)]
+        let mut process = {
+            let mut process = Command::new("sh");
+            process.arg(&setup);
+            process
+        };
+        #[cfg(not(windows))]
+        let mut process = Command::new(&setup);
+        let status = process
             .args(args)
             .env("FUNES_BIN", &funes)
             .env("FUNES_HOME", home::dir())
             .env("FUNES_AGENT_ID", &self.manifest.id)
             .status()
-            .with_context(|| format!("running `{command}`"))?;
+            .map_err(|e| {
+                // Windows port: no `sh` on PATH is the usual way this fails there, and the bare OS error
+                // ("program not found") does not say which program.
+                if cfg!(windows) && e.kind() == std::io::ErrorKind::NotFound {
+                    anyhow!(
+                        "running `{command}`: `sh` was not found on PATH. Install Git for Windows and put its \
+                         usr\\bin folder on PATH ahead of System32 (that folder's bash.exe is the WSL launcher, \
+                         not Git Bash)"
+                    )
+                } else {
+                    anyhow::Error::new(e).context(format!("running `{command}`"))
+                }
+            })?;
         if !status.success() {
             bail!("`{command}` failed (exit {:?})", status.code());
         }

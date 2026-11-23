@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>funes sessions</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --ink: #1c1c1a; --muted: #6b6b66; --line: #e3e3de;
+    --accent: #2f5fd0; --accent-ink: #ffffff; --drop: #b3261e; --drop-bg: #fbeceb; --ok: #1d7a46;
+    --warn-bg: #fff5da; --warn-line: #e6c569;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151514; --panel: #1e1e1c; --ink: #ececea; --muted: #9a9a94; --line: #34342f;
+      --accent: #7aa2ff; --accent-ink: #0d1530; --drop: #ff8a80; --drop-bg: #3a1f1d; --ok: #6fd39a;
+      --warn-bg: #3a3118; --warn-line: #7a6a2a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, "Segoe UI", sans-serif; }
+  header { padding: 14px 16px 10px; max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 18px; margin: 0 0 2px; }
+  .sub { color: var(--muted); font-size: 13px; }
+  main { max-width: 1200px; margin: 0 auto; padding: 0 16px 80px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; background: var(--panel);
+         border: 1px solid var(--line); border-radius: 10px; padding: 10px; margin-bottom: 10px; }
+  input[type=search], input[type=date], select { background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+         border-radius: 6px; padding: 6px 8px; font: inherit; }
+  input[type=search] { min-width: 200px; flex: 1; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+           border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  button.danger { color: var(--drop); border-color: var(--drop); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  label.chk { display: inline-flex; gap: 5px; align-items: center; color: var(--muted); }
+  .stats { display: flex; gap: 16px; flex-wrap: wrap; margin: 6px 2px 10px; }
+  .stat b { font-size: 16px; }
+  .stat.drop b { color: var(--drop); } .stat.keep b { color: var(--ok); }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line);
+          border-radius: 10px; overflow: hidden; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); background: var(--bg); }
+  tr.row { cursor: pointer; }
+  tr.row:hover td { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+  tr.dropped td { background: var(--drop-bg); color: var(--muted); }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.id { font: 12px ui-monospace, Consolas, monospace; color: var(--muted); word-break: break-all; }
+  td.snip { color: var(--muted); max-width: 420px; }
+  .repo { font-weight: 600; }
+  .tag { font-size: 11px; border: 1px solid var(--line); border-radius: 99px; padding: 0 6px; color: var(--muted); margin-left: 4px; }
+  .projects { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+  .chip { border: 1px solid var(--line); background: var(--panel); border-radius: 99px; padding: 3px 10px; cursor: pointer; font-size: 13px; }
+  .chip.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--panel)); }
+  .chip span { color: var(--muted); }
+  aside { position: fixed; top: 0; right: 0; bottom: 0; width: min(560px, 100vw); background: var(--panel);
+          border-left: 1px solid var(--line); box-shadow: -8px 0 24px rgba(0,0,0,.18); transform: translateX(102%);
+          transition: transform .18s; display: flex; flex-direction: column; z-index: 5; }
+  aside.open { transform: none; }
+  aside header { max-width: none; border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
+  aside header strong { flex: 1; font: 12px ui-monospace, Consolas, monospace; word-break: break-all; }
+  aside pre { margin: 0; padding: 12px 14px; overflow: auto; flex: 1; white-space: pre-wrap; font: 12.5px/1.5 ui-monospace, Consolas, monospace; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-top: 14px; }
+  .panel h2 { font-size: 15px; margin: 0 0 6px; }
+  .warn { background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 8px; padding: 8px 10px; margin: 8px 0; }
+  .log { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; max-height: 260px;
+         overflow: auto; font: 12px/1.45 ui-monospace, Consolas, monospace; white-space: pre-wrap; }
+  .err { color: var(--drop); }
+  .empty { padding: 28px; text-align: center; color: var(--muted); }
+  .prog { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin: 10px 0; background: var(--bg); }
+  .prog .head { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+  .pill { font-size: 12px; font-weight: 600; border-radius: 99px; padding: 1px 9px; border: 1px solid var(--line); color: var(--muted); }
+  .pill.running { color: var(--accent); border-color: var(--accent); }
+  .pill.done, .pill.swapped { color: var(--ok); border-color: var(--ok); }
+  .pill.error { color: var(--drop); border-color: var(--drop); }
+  .bar2 { height: 10px; background: var(--line); border-radius: 99px; overflow: hidden; margin: 8px 0 4px; }
+  .bar2 > div { height: 100%; width: 0; background: var(--accent); transition: width .4s; }
+  .prog.done .bar2 > div, .prog.swapped .bar2 > div { background: var(--ok); }
+  .prog.error .bar2 > div { background: var(--drop); }
+  .steps { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px; font-size: 13px; color: var(--muted); }
+  .steps .on { color: var(--accent); font-weight: 600; } .steps .ok { color: var(--ok); }
+  .mem { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 8px; margin: 8px 0; }
+  .mem > div { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+  .mem b { display: block; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-bottom: 2px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>funes sessions</h1>
+  <div class="sub" id="home">Loading your memory&hellip;</div>
+</header>
+<main>
+  <div class="stats">
+    <div class="stat"><b id="sTotal">0</b> sessions</div>
+    <div class="stat keep"><b id="sKeep">0</b> checked (will be kept)</div>
+    <div class="stat drop"><b id="sDrop">0</b> unchecked (left out)</div>
+    <div class="stat"><b id="sTurns">0</b> turns in the new memory</div>
+  </div>
+
+  <div class="projects" id="projects"></div>
+
+  <div class="bar">
+    <input type="search" id="q" placeholder="Filter by project, id or first message&hellip;">
+    <input type="date" id="from" title="Started on or after">
+    <input type="date" id="to" title="Started on or before">
+    <select id="show">
+      <option value="all">All sessions</option><option value="keep">Checked only</option><option value="drop">Unchecked only</option>
+    </select>
+    <select id="sort">
+      <option value="new">Newest</option><option value="old">Oldest</option><option value="turns">Most turns</option>
+    </select>
+    <label class="chk"><input type="checkbox" id="hideAgents"> hide sub-agents</label>
+  </div>
+  <div class="bar">
+    <label class="chk" style="color:var(--ink);font-weight:600"><input type="checkbox" id="toggleAll"> <span id="toggleLabel">Select all shown</span></label>
+    <span class="sub" style="flex:1;min-width:260px"><b>Checked sessions go into the new memory.</b> Unchecked ones are left out when you
+      build it. Nothing is deleted until you build and swap.</span>
+    <button id="dropAgents" title="Uncheck the sessions named agent-&hellip;, which another session spawned">Uncheck sub-agents</button>
+    <button id="reset">Check everything</button>
+    <button id="reload">Refresh</button>
+    <button id="export">Export lists</button>
+  </div>
+
+  <table>
+    <thead><tr><th style="width:64px" title="Checked = this session goes into the new memory">Include</th><th>Started</th><th>Project</th><th class="num">Turns</th><th>First message</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div class="empty" id="empty" hidden>No sessions match.</div>
+
+  <div class="panel" id="build">
+    <h2>Build a pruned memory</h2>
+    <div class="sub">funes can't delete from a memory, so this builds a <b>new</b> one from the checked sessions' original Claude transcripts.
+      Your live memory is not touched until you swap, and the old one is renamed, not deleted.</div>
+    <div class="warn" id="buildWarn" hidden></div>
+    <div class="prog" id="prog">
+      <div class="head"><span class="pill" id="pPill">Idle</span><span id="pHead">No build running.</span></div>
+      <div class="bar2"><div id="pBar"></div></div>
+      <div class="sub" id="pDetail"></div>
+      <div class="steps" id="pSteps"></div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <b style="font-size:13px">Memory status</b><button id="statusBtn">Refresh</button>
+      <span class="sub" id="statusAt"></span>
+    </div>
+    <div class="mem" id="mem"></div>
+    <p>
+      <button id="plan">Check what can be rebuilt</button>
+      <button id="go" class="primary" disabled>Build from checked sessions</button>
+    </p>
+    <div id="planOut" class="sub"></div>
+    <div class="log" id="log" hidden></div>
+    <div id="swapBox" hidden>
+      <div class="warn">Build finished. Swapping renames your current memory to <code>memory.before-prune-&lt;time&gt;</code>
+        and puts the new one in its place. Close Claude Code first, since its hooks write to the memory.
+        Don't re-run <code>funes add claude</code> afterwards: it re-converts every transcript, so unchecked sessions come back.</div>
+      <input type="search" id="swapConfirm" placeholder="Type SWAP to confirm" style="min-width:180px;flex:none">
+      <button id="swap" class="danger">Swap in the new memory</button>
+    </div>
+  </div>
+</main>
+
+<aside id="drawer">
+  <header><strong id="dId"></strong><button id="dKeep"></button><button id="dClose">Close</button></header>
+  <pre id="dText"></pre>
+</aside>
+
+<script>
+const TOKEN = "__TOKEN__";
+const $ = (id) => document.getElementById(id);
+let sessions = [];
+let dropped = new Set();
+let activeRepo = null;
+let drawerId = null;
+let polling = null;
+
+function store(get, key, val) {
+  try { return get ? JSON.parse(localStorage.getItem(key) || "null") : localStorage.setItem(key, JSON.stringify(val)); }
+  catch (e) { return null; }
+}
+async function api(path, body) {
+  const r = await fetch(path, {
+    method: body === undefined ? "GET" : "POST",
+    headers: { "X-Token": TOKEN, "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+const isAgent = (s) => s.id.startsWith("agent-");
+const day = (s) => s.start.slice(0, 10);
+function el(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  Object.assign(e, props || {});
+  for (const k of kids) e.append(k);
+  return e;
+}
+
+function filtered() {
+  const q = $("q").value.trim().toLowerCase();
+  const from = $("from").value, to = $("to").value, show = $("show").value;
+  let out = sessions.filter((s) => {
+    if (activeRepo && s.repo !== activeRepo) return false;
+    if ($("hideAgents").checked && isAgent(s)) return false;
+    if (from && day(s) < from) return false;
+    if (to && day(s) > to) return false;
+    if (show === "keep" && dropped.has(s.id)) return false;
+    if (show === "drop" && !dropped.has(s.id)) return false;
+    if (q && !(s.repo + " " + s.id + " " + s.snippet).toLowerCase().includes(q)) return false;
+    return true;
+  });
+  const sort = $("sort").value;
+  out.sort((a, b) => sort === "turns" ? b.turns - a.turns : sort === "old" ? a.start.localeCompare(b.start) : b.start.localeCompare(a.start));
+  return out;
+}
+
+function render() {
+  const shown = filtered();
+  const rows = $("rows");
+  rows.replaceChildren();
+  for (const s of shown) {
+    const cb = el("input", { type: "checkbox", checked: !dropped.has(s.id) });
+    cb.addEventListener("click", (e) => { e.stopPropagation(); toggle(s.id, cb.checked); });
+    const tr = el("tr", { className: "row" + (dropped.has(s.id) ? " dropped" : "") },
+      el("td", {}, cb),
+      el("td", { className: "num", textContent: s.start.replace("T", " ").slice(0, 16) }),
+      el("td", {}, el("span", { className: "repo", textContent: s.repo }), isAgent(s) ? el("span", { className: "tag", textContent: "sub-agent" }) : ""),
+      el("td", { className: "num", textContent: s.turns }),
+      el("td", { className: "snip", textContent: s.snippet || "(no text)" }));
+    tr.addEventListener("click", () => openDrawer(s));
+    rows.append(tr);
+  }
+  $("empty").hidden = shown.length > 0;
+  const keptShown = shown.filter((s) => !dropped.has(s.id)).length;
+  const all = $("toggleAll");
+  all.checked = shown.length > 0 && keptShown === shown.length;
+  all.indeterminate = keptShown > 0 && keptShown < shown.length;
+  all.disabled = shown.length === 0;
+  $("toggleLabel").textContent = `Select all shown (${shown.length})`;
+  const kept = sessions.filter((s) => !dropped.has(s.id));
+  $("sTotal").textContent = sessions.length;
+  $("sKeep").textContent = kept.length;
+  $("sDrop").textContent = sessions.length - kept.length;
+  $("sTurns").textContent = kept.reduce((n, s) => n + s.turns, 0).toLocaleString();
+  $("go").disabled = true;
+  renderProjects();
+}
+
+function renderProjects() {
+  const by = new Map();
+  for (const s of sessions) {
+    const p = by.get(s.repo) || { n: 0, drop: 0 };
+    p.n++; if (dropped.has(s.id)) p.drop++;
+    by.set(s.repo, p);
+  }
+  const box = $("projects");
+  box.replaceChildren();
+  for (const [repo, p] of [...by].sort((a, b) => b[1].n - a[1].n)) {
+    const chip = el("div", { className: "chip" + (activeRepo === repo ? " on" : "") },
+      repo + " ", el("span", { textContent: p.drop ? `${p.n - p.drop}/${p.n}` : String(p.n) }));
+    chip.addEventListener("click", () => { activeRepo = activeRepo === repo ? null : repo; render(); });
+    box.append(chip);
+  }
+}
+
+function persist() { store(false, "funes-dropped", [...dropped]); }
+function toggle(id, keep) { keep ? dropped.delete(id) : dropped.add(id); persist(); render(); syncDrawer(); }
+function setMany(list, keep) { for (const s of list) keep ? dropped.delete(s.id) : dropped.add(s.id); persist(); render(); syncDrawer(); }
+
+async function openDrawer(s) {
+  drawerId = s.id;
+  $("dId").textContent = s.repo + "  ·  " + s.id;
+  $("dText").textContent = "Loading digest…";
+  $("drawer").classList.add("open");
+  syncDrawer();
+  try { const j = await api("/api/sketch?id=" + encodeURIComponent(s.id)); if (drawerId === s.id) $("dText").textContent = j.text; }
+  catch (e) { $("dText").textContent = "Could not load: " + e.message; }
+}
+function syncDrawer() { if (drawerId) $("dKeep").textContent = dropped.has(drawerId) ? "Unchecked - click to check" : "Checked - click to uncheck"; }
+$("dKeep").addEventListener("click", () => drawerId && toggle(drawerId, dropped.has(drawerId)));
+$("dClose").addEventListener("click", () => { drawerId = null; $("drawer").classList.remove("open"); });
+
+async function load() {
+  $("home").textContent = "Loading your memory…";
+  try {
+    const j = await api("/api/sessions");
+    sessions = j.sessions;
+    $("home").textContent = j.home + "  ·  read-only until you build";
+    const saved = store(true, "funes-dropped") || [];
+    const known = new Set(sessions.map((s) => s.id));
+    dropped = new Set(saved.filter((id) => known.has(id)));
+    render();
+  } catch (e) {
+    $("home").replaceChildren(el("span", { className: "err", textContent: "Could not read sessions: " + e.message }));
+  }
+}
+
+for (const id of ["q", "from", "to", "show", "sort", "hideAgents"]) $(id).addEventListener("input", render);
+$("toggleAll").addEventListener("change", (e) => setMany(filtered(), e.target.checked));
+$("dropAgents").addEventListener("click", () => setMany(sessions.filter(isAgent), false));
+$("reset").addEventListener("click", () => { dropped.clear(); persist(); render(); syncDrawer(); });
+$("reload").addEventListener("click", load);
+$("export").addEventListener("click", () => {
+  const out = { keep: sessions.filter((s) => !dropped.has(s.id)).map((s) => s.id), drop: [...dropped] };
+  const a = el("a", { href: URL.createObjectURL(new Blob([JSON.stringify(out, null, 2)], { type: "application/json" })), download: "funes-sessions.json" });
+  a.click();
+});
+
+const keepList = () => sessions.filter((s) => !dropped.has(s.id)).map((s) => s.id);
+$("plan").addEventListener("click", async () => {
+  const warn = $("buildWarn");
+  warn.hidden = true;
+  try {
+    const p = await api("/api/plan", { keep: keepList() });
+    $("planOut").textContent = `${p.found} of ${p.keep} checked sessions can be rebuilt from their transcripts.`;
+    if (p.missing.length) {
+      warn.hidden = false;
+      warn.textContent = `${p.missing.length} checked sessions no longer have a transcript on disk (e.g. ${p.missing.slice(0, 3).join(", ")}). `
+        + "A rebuild can't include them, so they would not be in the new memory. They stay in your current memory, which you can keep as an archive. ";
+      const btn = el("button", { textContent: `Uncheck these ${p.missing.length}` });
+      btn.addEventListener("click", () => {
+        const gone = new Set(p.missing);
+        setMany(sessions.filter((s) => gone.has(s.id)), false);
+        warn.hidden = true;
+        $("planOut").textContent = "Unchecked. Click “Check what can be rebuilt” again to confirm.";
+      });
+      warn.append(btn);
+    }
+    $("go").disabled = p.missing.length > 0 || p.keep === 0;
+  } catch (e) { $("planOut").replaceChildren(el("span", { className: "err", textContent: e.message })); }
+});
+$("go").addEventListener("click", async () => {
+  if (!confirm(`Build a new memory from the ${keepList().length} checked sessions? It re-embeds them on the CPU and can take a long time. The live memory is not changed.`)) return;
+  try {
+    const j = await api("/api/rebuild", { keep: keepList() });
+    $("planOut").textContent = "Building into " + j.newhome;
+    $("log").hidden = false;
+    poll();
+  } catch (e) { $("planOut").replaceChildren(el("span", { className: "err", textContent: e.message })); }
+});
+const STEPS = ["Convert transcripts", "Read sessions", "Embed", "Compact and search index"];
+const STAGE_STEP = { converting: 0, reading: 1, embedding: 2, compacting: 3, indexing: 3, finishing: 4 };
+const fmt = (sec) => {
+  sec = Math.max(0, Math.round(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), r = sec % 60;
+  return h ? `${h}h ${m}m` : m ? `${m}m ${String(r).padStart(2, "0")}s` : `${r}s`;
+};
+const baseTitle = document.title;
+
+function renderJob(j) {
+  $("prog").className = "prog " + j.state;
+  const pill = $("pPill");
+  pill.className = "pill " + j.state;
+  pill.textContent = { idle: "Idle", running: "Running", done: "Complete", error: "Failed", swapped: "Swapped in" }[j.state] || j.state;
+  const elapsed = j.started ? (j.finished || j.now) - j.started : 0;
+  const stepIdx = STAGE_STEP[j.stage] ?? -1;
+  let pct = 0, head = "No build running.", detail = "";
+  if (j.state === "running") {
+    const frac = j.total ? j.done / j.total : 0;
+    // Converting and reading get 10% of the bar each, embedding 70%, compact + search index the last 10%.
+    pct = j.stage === "converting" ? 10 * frac : j.stage === "reading" ? 10 + 10 * frac
+      : j.stage === "embedding" ? 20 + 70 * frac : j.stage === "indexing" ? 95 : 90;
+    const label = { converting: "Converting transcripts", reading: "Reading sessions", embedding: "Embedding",
+      compacting: "Compacting the memory", indexing: "Building the search index" }[j.stage] || "Working";
+    head = j.total && ["converting", "reading", "embedding"].includes(j.stage)
+      ? `${label}: ${j.done.toLocaleString()} of ${j.total.toLocaleString()}` : `${label}…`;
+    const eta = j.stage === "embedding" && j.rate ? ` · about ${fmt((j.total - j.done) / j.rate)} left at ${j.rate}/s` : "";
+    detail = `Elapsed ${fmt(elapsed)}${eta}. Embedding runs one pass per block type, so the bar can restart a few times.`;
+  } else if (j.state === "done") {
+    pct = 100; head = `Complete in ${fmt(elapsed)}. The new memory is built; your live memory is untouched.`;
+    detail = "Swap it in below when you are ready.";
+  } else if (j.state === "swapped") {
+    pct = 100; head = "Swapped in. Restart Claude Code.";
+  } else if (j.state === "error") {
+    pct = 100; head = "The build failed."; detail = (j.log[j.log.length - 1] || "").slice(0, 400);
+  }
+  $("pBar").style.width = Math.min(100, Math.round(pct)) + "%";
+  $("pHead").textContent = head;
+  $("pDetail").textContent = detail;
+  const steps = $("pSteps");
+  steps.replaceChildren();
+  if (j.state !== "idle") {
+    STEPS.forEach((name, i) => {
+      const done = j.state === "done" || j.state === "swapped" || i < stepIdx;
+      const on = j.state === "running" && i === Math.min(stepIdx, 3);
+      steps.append(el("span", { className: done ? "ok" : on ? "on" : "", textContent: (done ? "✔ " : on ? "● " : "○ ") + name }));
+    });
+  }
+  document.title = j.state === "running" ? `${Math.round(pct)}% · funes sessions`
+    : j.state === "done" ? "✔ Build complete · funes sessions"
+    : j.state === "error" ? "✖ Build failed · funes sessions" : baseTitle;
+  const log = $("log");
+  log.hidden = j.log.length === 0;
+  log.textContent = j.log.join("\n");
+  log.scrollTop = log.scrollHeight;
+  $("swapBox").hidden = j.state !== "done";
+}
+
+async function renderStatus() {
+  try {
+    const r = await api("/api/status");
+    const box = $("mem");
+    box.replaceChildren();
+    const card = (title, m) => {
+      const lines = m.exists
+        ? [`${(m.chunks ?? 0).toLocaleString()} chunks · ${(m.sessions ?? 0).toLocaleString()} sessions`,
+           m.awaiting ? `${m.awaiting.toLocaleString()} chunks still awaiting embedding: indexing is NOT complete`
+             : "All chunks embedded: indexing complete"]
+        : ["No memory here yet."];
+      if (m.pending) lines.push(`${m.pending.toLocaleString()} source sessions not yet indexed`);
+      box.append(el("div", {}, el("b", { textContent: title }),
+        ...lines.map((t) => el("div", { textContent: t })), el("div", { className: "sub", textContent: m.home })));
+    };
+    card("Live memory", r.live);
+    if (r.source) card("Archive (the list above comes from here)", r.source);
+    if (r.building) card("New memory being built", r.building);
+    $("statusAt").textContent = (r.funes_running ? "funes is running · " : "no funes process running · ") + "checked " + new Date().toLocaleTimeString();
+  } catch (e) { $("statusAt").textContent = "status failed: " + e.message; }
+}
+$("statusBtn").addEventListener("click", renderStatus);
+
+function poll() {
+  clearInterval(polling);
+  let tick = 0;
+  const step = async () => {
+    try {
+      const j = await api("/api/job");
+      renderJob(j);
+      if (tick++ % 5 === 0 || j.state !== "running") renderStatus();
+      if (j.state !== "running") clearInterval(polling);
+    } catch (e) { clearInterval(polling); }
+  };
+  step();
+  polling = setInterval(step, 2000);
+}
+$("swap").addEventListener("click", async () => {
+  try {
+    const j = await api("/api/swap", { confirm: $("swapConfirm").value.trim() });
+    $("planOut").textContent = `Swapped: the live memory now has ${(j.chunks || 0).toLocaleString()} chunks in ${(j.sessions || 0).toLocaleString()} sessions. `
+      + "The previous memory is kept as " + j.kept_as + " in " + j.home + ". Restart Claude Code."
+      + (j.warning ? " WARNING: " + j.warning : "");
+    $("swapBox").hidden = true;
+    load();
+  } catch (e) { $("planOut").replaceChildren(el("span", { className: "err", textContent: e.message })); }
+});
+
+load();
+api("/api/job").then((j) => { renderJob(j); if (j.state === "running") poll(); }).catch(() => {});
+renderStatus();
+</script>
+</body>
+</html>
