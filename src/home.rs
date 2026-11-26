@@ -60,6 +60,12 @@ pub fn sketch_cache_dir() -> PathBuf {
     dir().join("cache/session-sketch")
 }
 
+/// fastembed's model cache (ONNX build). Pinned here because fastembed otherwise writes
+/// `.fastembed_cache` into whatever the working directory is.
+pub fn fastembed_cache_dir() -> PathBuf {
+    dir().join("cache/fastembed")
+}
+
 /// The lock a funes up to 1.6 takes on the local memory: in the home, not in the memory.
 pub fn legacy_lock_file() -> PathBuf {
     dir().join("store.lock")

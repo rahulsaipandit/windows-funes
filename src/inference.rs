@@ -192,7 +192,11 @@ impl OnnxEmbedder {
         };
         Ok(Self {
             model,
-            inner: TextEmbedding::try_new(InitOptions::new(fastembed_model).with_max_length(MAX_LEN))?,
+            inner: TextEmbedding::try_new(
+                InitOptions::new(fastembed_model)
+                    .with_max_length(MAX_LEN)
+                    .with_cache_dir(crate::home::fastembed_cache_dir()),
+            )?,
         })
     }
 }

@@ -50,6 +50,23 @@ exec "$(dirname "$0")/jq-real.exe" -b "$@"
 Check it: `sh ~/.funes/agents/claude/claude-plugin/funes/test/run.sh` prints
 `claude converter: ok` once the integration is installed (step 5).
 
+### Updating funes
+
+Rebuild and replace the binary whenever the source changes. Example: the build that pins the
+fastembed cache to `FUNES_HOME` (fixes `.fastembed_cache` appearing in every project folder).
+
+1. **Build** with the same flags as step 2: `cargo build --release --no-default-features --features onnx`.
+2. **Test the new binary from `target\release`** before installing: `funes status` and a
+   `funes recall "…"`. With the fix, `$FUNES_HOME\cache\fastembed` appears and no `.fastembed_cache`
+   is created in the folder you ran it from.
+3. **Back up, then install.** Windows lets you rename a running `funes.exe` but not overwrite it, so
+   rename the installed one to `funes.exe.prev` (it is your rollback), then copy the new one in.
+4. **Restart VS Code** (every window). Each window's `funes mcp` keeps running the old binary until
+   it restarts.
+5. **Verify:** open a folder you never used with funes, run a recall, and check that no
+   `.fastembed_cache` was created there. Then delete the old `.fastembed_cache` folders and
+   `funes.exe.prev`.
+
 ## 4. Choose where funes stores things
 
 By default funes keeps its state in `~\.funes` and the embedding and reranker weights (about 1.4
@@ -65,6 +82,12 @@ them off the C: drive, set environment variables **before** you index:
 `HF_HUB_CACHE` moves only the model cache, so a token written by `hf auth login` is still found.
 It applies to every Hugging Face tool you run, not just funes: they look in the new folder and
 download their own models again. If that matters, skip `HF_HUB_CACHE` and leave the weights on C:.
+
+The `onnx` build also keeps fastembed's embedder cache under `FUNES_HOME`, in `cache\fastembed`
+(`D:\funes\cache\fastembed` above). Older builds left fastembed's own default, a `.fastembed_cache`
+folder in the **current directory**, so every folder Claude Code opened (it starts `funes mcp` there)
+got its own copy of the model. If you see `.fastembed_cache` folders in your projects, update funes
+(see "Updating funes" under section 3) and delete them.
 
 The agent registry stays at `~\.funes\agents` and the install id at `~\.funes\install-id`
 whatever `FUNES_HOME` says. Restart Claude Code (every window) after changing either variable.
@@ -351,6 +374,7 @@ before, and why did we move off it?").
 | `automated funes index needs a target` | add `--harness claude` |
 | `trufflehog not found` on `funes push` | publishing needs `trufflehog.exe` on `PATH` or `FUNES_TRUFFLEHOG`; local use does not |
 | `funes status` shows old counts after a fresh install | indexing has not run; do step 6 |
+| `.fastembed_cache` folders appear in project folders | a funes built before the cache was pinned; update it (step 3, "Updating funes"), then delete the folders |
 | Build fails with stale-metadata or "can't find crate" errors | a cargo run was killed mid-build; delete `target\debug` and rebuild |
 
 ## Privacy and security

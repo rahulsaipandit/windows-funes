@@ -73,8 +73,8 @@ access to the target dataset repository. Public-memory recall needs no token.
 The default inference backend downloads its pinned embedder and reranker into the standard
 Hugging Face cache (`$HF_HUB_CACHE` when set, else `$HF_HOME/hub`, else
 `~/.cache/huggingface/hub`). The optional ONNX build
-downloads its reranker there too, and its embedders into fastembed's `.fastembed_cache` under the
-process working directory unless configured by that library.
+downloads its reranker there too, and its embedders into `$FUNES_HOME/cache/fastembed`
+(`~/.funes/cache/fastembed` by default), not fastembed's working-directory `.fastembed_cache`.
 
 Remote `hf://` recall also uses the standard hf-hub file cache. `HF_HUB_CACHE` can relocate that
 cache; `HF_HOME` relocates the broader Hugging Face home. See [hub-caching.md](hub-caching.md) for the
